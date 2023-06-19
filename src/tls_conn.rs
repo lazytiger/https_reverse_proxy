@@ -17,18 +17,6 @@ pub enum TlsSession {
 }
 
 impl TlsSession {
-    #[allow(dead_code)]
-    pub fn set_buffer_limit(&mut self, limit: Option<usize>) {
-        match self {
-            TlsSession::Server(conn) => {
-                conn.set_buffer_limit(limit);
-            }
-            TlsSession::Client(conn, ..) => {
-                conn.set_buffer_limit(limit);
-            }
-        }
-    }
-
     pub fn reader(&mut self) -> Reader {
         match self {
             TlsSession::Server(conn) => conn.reader(),
@@ -68,13 +56,6 @@ impl TlsSession {
         match self {
             TlsSession::Server(conn) => conn.server_name(),
             TlsSession::Client(_) => None,
-        }
-    }
-
-    pub fn is_handshaking(&self) -> bool {
-        match self {
-            TlsSession::Server(conn) => conn.is_handshaking(),
-            TlsSession::Client(conn) => conn.is_handshaking(),
         }
     }
 }
@@ -215,7 +196,7 @@ impl TlsConnection for TlsStream {
     }
 
     fn handshake(&mut self) -> Result<bool> {
-        if self.session.is_handshaking() {
+        if self.session.server_name().is_none() {
             match self
                 .session
                 .read_tls(&mut self.stream)
@@ -224,6 +205,7 @@ impl TlsConnection for TlsStream {
                 Err(Some(err)) => return Err(err),
                 _ => (),
             }
+            self.session.process_new_packets()?;
 
             match self
                 .session
@@ -234,7 +216,7 @@ impl TlsConnection for TlsStream {
                 _ => (),
             }
         }
-        Ok(!self.session.is_handshaking())
+        Ok(self.session.server_name().is_some())
     }
 
     fn new_client_with_stream(

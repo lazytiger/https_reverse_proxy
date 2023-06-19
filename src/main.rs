@@ -34,7 +34,7 @@ fn main() -> Result<()> {
         ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
-            .with_cert_resolver(resolver.clone()),
+            .with_cert_resolver(resolver),
     );
     let mut root_store = RootCertStore::empty();
     root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
@@ -60,19 +60,21 @@ fn main() -> Result<()> {
     loop {
         poll.poll(&mut events, None).unwrap();
         for event in &events {
+            log::info!("event:{:?}", event);
             match event.token().0 {
                 0 => {
-                    let (client, _) = listener.accept()?;
-                    let conn = ProxyConnection::new(
-                        TlsStream::new_server(client, server_config.clone(), Some(4096))?,
-                        index,
-                        client_config.clone(),
-                        poll.registry(),
-                    )?;
-                    manager.push(index, conn);
-                    index += 1;
-                    if index < 2 {
-                        index = 2;
+                    while let Ok((client, _)) = listener.accept() {
+                        let conn = ProxyConnection::new(
+                            TlsStream::new_server(client, server_config.clone(), Some(4096))?,
+                            index,
+                            client_config.clone(),
+                            poll.registry(),
+                        )?;
+                        manager.push(index, conn);
+                        index += 2;
+                        if index < 2 {
+                            index = 2;
+                        }
                     }
                 }
                 1 => {

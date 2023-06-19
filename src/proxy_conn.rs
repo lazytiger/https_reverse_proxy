@@ -8,7 +8,7 @@ use rustls::{ClientConfig, ServerName};
 
 use crate::dns_resolver::DnsResolver;
 use crate::tls_conn::TlsConnection;
-use crate::types::{Error, Result};
+use crate::types::{from_io_error, Error, Result};
 
 pub struct ProxyConnection<L> {
     local: L,
@@ -32,11 +32,7 @@ where
         config: Arc<ClientConfig>,
         registry: &Registry,
     ) -> Result<Self> {
-        local.register(
-            registry,
-            Token(index),
-            Interest::READABLE | Interest::WRITABLE,
-        )?;
+        local.register(registry, Token(index), Interest::READABLE)?;
         Ok(Self {
             local,
             remote: None,
@@ -51,38 +47,68 @@ where
     }
 
     pub fn local_to_remote(&mut self) {
+        log::info!("copy local data to remote");
         match copy_with_remaining(
             &mut self.local_remaining,
             &mut self.local,
             self.remote.as_mut().unwrap(),
             !self.local_closed,
         ) {
-            Err(Error::ReaderClosed) => self.local_closed = true,
-            Err(Error::WriterClosed) => self.remote_closed = true,
-            _ => {}
+            Err(Error::ReaderClosed) => {
+                log::info!("local closed");
+                self.local_closed = true;
+            }
+            Err(err) => {
+                log::info!("remote closed:{:?}", err);
+                self.remote_closed = true;
+            }
+            ret => {
+                log::info!("local to remote return:{:?}", ret);
+            }
+        }
+        if self.local_remaining.is_some() {
+            log::info!("send to remote blocked");
         }
     }
 
     pub fn remote_to_local(&mut self) {
+        log::info!("copy remote data to local");
         match copy_with_remaining(
             &mut self.remote_remaining,
             self.remote.as_mut().unwrap(),
             &mut self.local,
             !self.remote_closed,
         ) {
-            Err(Error::ReaderClosed) => self.remote_closed = true,
-            Err(Error::WriterClosed) => self.local_closed = true,
-            _ => {}
+            Err(Error::ReaderClosed) => {
+                log::info!("remote closed");
+                self.remote_closed = true;
+            }
+            Err(err) => {
+                log::info!("local closed:{:?}", err);
+                self.local_closed = true;
+            }
+            ret => {
+                log::info!("remote to local return:{:?}", ret);
+            }
+        }
+        if self.remote_remaining.is_some() {
+            log::info!("remote to local blocked");
         }
     }
 
     pub fn tick(&mut self, resolver: &mut DnsResolver) {
+        log::info!("connection:{} ticked", self.index);
         if !self.handshake_done {
             match self.local.handshake() {
-                Err(_) => self.local_closed = true,
+                Err(err) => {
+                    log::info!("handshake failed:{:?}", err);
+                    self.local_closed = true;
+                    self.remote_closed = true;
+                }
                 Ok(true) => {
                     self.handshake_done = true;
                     if let Some(server_name) = self.local.server_name() {
+                        log::info!("get server_name:{}", server_name);
                         resolver.query(server_name, self.index).unwrap();
                     } else {
                         log::error!("no server name found");
@@ -90,7 +116,9 @@ where
                         self.remote_closed = true;
                     }
                 }
-                _ => (),
+                _ => {
+                    log::info!("handshake not done");
+                }
             }
         }
         if self.remote.is_some() {
@@ -103,6 +131,7 @@ where
         let ip = ips.get(0).ok_or(Error::DnsQuery)?;
         let addr = SocketAddr::new(*ip, 443);
         let stream = TcpStream::connect(addr)?;
+        log::info!("connection to {}", addr);
         let mut remote = self.local.new_client_with_stream(
             stream,
             self.config.clone(),
@@ -122,14 +151,18 @@ where
             log::error!("connect to remote:{:?} failed:{:?}", ips, err);
             self.remote_closed = true;
             self.local_closed = true;
+        } else {
+            log::info!("do transfer now");
+            self.local_to_remote();
+            self.remote_to_local();
         }
     }
 
     pub(crate) fn is_safe_to_close(&self) -> bool {
         match (self.local_closed, self.remote_closed) {
             (true, true) => true,
-            (false, true) => self.remote_remaining.is_some(),
-            (true, false) => self.local_remaining.is_some(),
+            (false, true) => self.remote_remaining.is_none(),
+            (true, false) => self.local_remaining.is_none(),
             (false, false) => false,
         }
     }
@@ -153,6 +186,7 @@ where
     W: Write,
 {
     if let Some(remaining) = remaining {
+        log::info!("there is remaining data, send first");
         let n = write_all(writer, remaining.as_slice())?;
         let m = remaining.len();
         if n > 0 && n < m {
@@ -162,13 +196,21 @@ where
             }
         }
         if !remaining.is_empty() {
-            return Ok(());
+            return if let Err(Some(err)) = writer.flush().map_err(from_io_error) {
+                Err(Error::WriterClosed)
+            } else {
+                Ok(())
+            };
         }
     }
     *remaining = None;
     if should_copy {
+        log::info!("copy started");
         let ret = copy(reader, writer)?;
         *remaining = ret;
+        if let Err(Some(err)) = writer.flush().map_err(from_io_error) {
+            return Err(Error::WriterClosed);
+        }
     }
     Ok(())
 }
@@ -204,6 +246,7 @@ fn write_all<W>(writer: &mut W, mut data: &[u8]) -> Result<usize>
 where
     W: Write,
 {
+    log::info!("{}", String::from_utf8_lossy(data));
     let mut len = 0;
     loop {
         match writer.write(data) {

@@ -60,24 +60,18 @@ impl DynamicCertificateResolver {
 
 impl ResolvesServerCert for DynamicCertificateResolver {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        println!("resolve now");
         let name = client_hello.server_name()?.to_string();
-        println!("resolve {} now", name);
+        log::info!("try resolve {} certificate", name);
         let certs = self.certs.lock().ok()?;
         let ck = if let Some(ck) = certs.get(&name) {
             ck.clone()
         } else {
             drop(certs);
-            println!("{} not found, signing now", name);
             let ret = self.sign(name.as_str());
-            if let Err(err) = &ret {
-                println!("sign failed:{:?}", err);
-            }
             let ck = Arc::new(ret.ok()?);
             let mut certs = self.certs.lock().ok()?;
             certs.insert(name, ck.clone());
             //TODO save ck into files
-            println!("sign ok");
             ck
         };
         Some(ck)

@@ -30,6 +30,7 @@ impl ProxyManager {
                 conn.close_now(registry);
             }
             self.proxies.remove(index);
+            log::info!("connection:{} removed", index);
         }
         self.to_removed.clear();
     }
