@@ -1,0 +1,20 @@
+[package]
+name = "https_reverse_proxy"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rcgen = { version = "0.11", features = ["x509-parser"] }
+rustls = { version = "0.21", features = [] }
+clap = { version = "4.3", features = ["derive"] }
+derive_more = "0.99"
+rustls-pemfile = "1.0"
+pem = "2.0"
+mio = { version = "0.8", features = ["net", "os-ext"] }
+fern = { version = "0.6", features = [] }
+log = "0.4"
+libc = "0.2"
+cfg-if = "1.0"
+chrono = "0.4"
