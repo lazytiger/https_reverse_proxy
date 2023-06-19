@@ -2,6 +2,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use mio::event::Event;
 use mio::net::TcpStream;
 use mio::{Interest, Registry, Token};
 use rustls::{ClientConfig, ServerName};
@@ -32,7 +33,11 @@ where
         config: Arc<ClientConfig>,
         registry: &Registry,
     ) -> Result<Self> {
-        local.register(registry, Token(index), Interest::READABLE)?;
+        local.register(
+            registry,
+            Token(index),
+            Interest::WRITABLE | Interest::READABLE,
+        )?;
         Ok(Self {
             local,
             remote: None,
@@ -47,12 +52,14 @@ where
     }
 
     pub fn local_to_remote(&mut self) {
+        if self.remote_closed {
+            return;
+        }
         log::info!("copy local data to remote");
         match copy_with_remaining(
             &mut self.local_remaining,
             &mut self.local,
             self.remote.as_mut().unwrap(),
-            !self.local_closed,
         ) {
             Err(Error::ReaderClosed) => {
                 log::info!("local closed");
@@ -72,12 +79,14 @@ where
     }
 
     pub fn remote_to_local(&mut self) {
+        if self.local_closed {
+            return;
+        }
         log::info!("copy remote data to local");
         match copy_with_remaining(
             &mut self.remote_remaining,
             self.remote.as_mut().unwrap(),
             &mut self.local,
-            !self.remote_closed,
         ) {
             Err(Error::ReaderClosed) => {
                 log::info!("remote closed");
@@ -96,7 +105,7 @@ where
         }
     }
 
-    pub fn tick(&mut self, resolver: &mut DnsResolver) {
+    pub fn tick(&mut self, event: &Event, registry: &Registry, resolver: &mut DnsResolver) {
         log::info!("connection:{} ticked", self.index);
         if !self.handshake_done {
             match self.local.handshake() {
@@ -107,6 +116,7 @@ where
                 }
                 Ok(true) => {
                     self.handshake_done = true;
+                    log::info!("is_handshaking:{}", self.local.is_handshaking());
                     if let Some(server_name) = self.local.server_name() {
                         log::info!("get server_name:{}", server_name);
                         resolver.query(server_name, self.index).unwrap();
@@ -121,6 +131,7 @@ where
                 }
             }
         }
+
         if self.remote.is_some() {
             self.local_to_remote();
             self.remote_to_local();
@@ -140,7 +151,7 @@ where
         remote.register(
             registry,
             Token(self.index + 1),
-            Interest::READABLE | Interest::WRITABLE,
+            Interest::WRITABLE | Interest::READABLE,
         )?;
         let _ = self.remote.replace(remote);
         Ok(())
@@ -179,7 +190,6 @@ fn copy_with_remaining<R, W>(
     remaining: &mut Option<Vec<u8>>,
     reader: &mut R,
     writer: &mut W,
-    should_copy: bool,
 ) -> Result<()>
 where
     R: Read,
@@ -204,13 +214,11 @@ where
         }
     }
     *remaining = None;
-    if should_copy {
-        log::info!("copy started");
-        let ret = copy(reader, writer)?;
-        *remaining = ret;
-        if let Err(Some(err)) = writer.flush().map_err(from_io_error) {
-            return Err(Error::WriterClosed);
-        }
+    log::info!("copy started");
+    let ret = copy(reader, writer)?;
+    *remaining = ret;
+    if let Err(Some(err)) = writer.flush().map_err(from_io_error) {
+        return Err(Error::WriterClosed);
     }
     Ok(())
 }

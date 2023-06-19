@@ -9,7 +9,7 @@ use rustls::{
     Writer,
 };
 
-use crate::types::{from_io_error, Result};
+use crate::types::{from_io_error, is_would_block, Result};
 
 pub enum TlsSession {
     Server(ServerConnection),
@@ -17,6 +17,12 @@ pub enum TlsSession {
 }
 
 impl TlsSession {
+    pub fn is_handshaking(&self) -> bool {
+        match self {
+            TlsSession::Server(conn) => conn.is_handshaking(),
+            TlsSession::Client(conn) => conn.is_handshaking(),
+        }
+    }
     pub fn reader(&mut self) -> Reader {
         match self {
             TlsSession::Server(conn) => conn.reader(),
@@ -126,21 +132,27 @@ impl Read for TlsStream {
         debug_assert!(!buf.is_empty());
         match self.session.reader().read(buf) {
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                log::info!("session has no data, try stream");
                 match self.session.read_tls(&mut self.stream) {
                     Ok(n) if n > 0 => {
+                        log::info!("stream got {} bytes", n);
                         if let Err(err) = self.session.process_new_packets() {
                             Err(Error::new(ErrorKind::InvalidData, err))
                         } else {
                             self.read(buf)
                         }
                     }
-                    Err(err) if err.kind() == ErrorKind::NotConnected => {
-                        Err(ErrorKind::WouldBlock.into())
+                    Err(err) if is_would_block(&err) => Err(ErrorKind::WouldBlock.into()),
+                    ret => {
+                        log::info!("read_tls return:{:?}", ret);
+                        ret
                     }
-                    ret => ret,
                 }
             }
-            ret => ret,
+            ret => {
+                log::info!("reader return {:?}", ret);
+                ret
+            }
         }
     }
 }
@@ -150,27 +162,36 @@ impl Write for TlsStream {
         debug_assert!(!buf.is_empty());
         match self.session.writer().write(buf) {
             Ok(0) => match self.session.write_tls(&mut self.stream) {
-                Err(err) if err.kind() == ErrorKind::NotConnected => {
-                    Err(ErrorKind::WouldBlock.into())
-                }
+                Err(err) if is_would_block(&err) => Err(ErrorKind::WouldBlock.into()),
                 Ok(n) if n > 0 => self.write(buf),
-                ret => ret,
+                ret => {
+                    log::info!("write_tls return {:?}", ret);
+                    ret
+                }
             },
-            ret => ret,
+            ret => {
+                log::info!("writer return {:?}", ret);
+                ret
+            }
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.session
+        let ret = self
+            .session
             .write_tls(&mut self.stream)
-            .map(|_| ())
+            .map(|n| {
+                log::info!("flush {} bytes", n);
+            })
             .map_err(|err| {
-                if err.kind() == ErrorKind::NotConnected {
+                if is_would_block(&err) {
                     ErrorKind::WouldBlock.into()
                 } else {
                     err
                 }
-            })
+            });
+        log::info!("flush return:{:?}", ret);
+        ret
     }
 }
 
@@ -188,6 +209,7 @@ pub trait TlsConnection: Read + Write + Source + Sized {
         stream: TcpStream,
         config: Arc<ServerConfig>,
     ) -> Result<Self>;
+    fn is_handshaking(&self) -> bool;
 }
 
 impl TlsConnection for TlsStream {
@@ -197,6 +219,7 @@ impl TlsConnection for TlsStream {
 
     fn handshake(&mut self) -> Result<bool> {
         if self.session.server_name().is_none() {
+            log::info!("handshaking now");
             match self
                 .session
                 .read_tls(&mut self.stream)
@@ -234,5 +257,9 @@ impl TlsConnection for TlsStream {
         config: Arc<ServerConfig>,
     ) -> Result<Self> {
         TlsStream::new_server(stream, config, self.buffer_limit)
+    }
+
+    fn is_handshaking(&self) -> bool {
+        self.session.is_handshaking()
     }
 }

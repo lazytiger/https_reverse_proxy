@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
+use mio::event::Event;
 use mio::Registry;
 
 use crate::dns_resolver::DnsResolver;
@@ -13,10 +14,16 @@ pub struct ProxyManager {
 }
 
 impl ProxyManager {
-    pub fn dispatch(&mut self, index: usize, dns_resolver: &mut DnsResolver) {
+    pub fn dispatch(
+        &mut self,
+        index: usize,
+        event: &Event,
+        registry: &Registry,
+        dns_resolver: &mut DnsResolver,
+    ) {
         let mut close = false;
         if let Some(conn) = self.proxies.get_mut(&index) {
-            conn.tick(dns_resolver);
+            conn.tick(event, registry, dns_resolver);
             close = conn.is_safe_to_close();
         }
         if close {

@@ -27,3 +27,10 @@ pub fn from_io_error(err: std::io::Error) -> Option<Error> {
         _ => Some(Error::Handshake),
     }
 }
+
+pub fn is_would_block(err: &std::io::Error) -> bool {
+    match err.kind() {
+        ErrorKind::NotConnected | ErrorKind::Interrupted => true,
+        _ => false,
+    }
+}

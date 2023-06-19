@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -19,6 +19,20 @@ pub struct Options {
     #[arg(short = 'k', long)]
     pub ca_key_path: String,
 
+    #[clap(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Parser)]
+pub enum Command {
+    #[clap(version, name = "run", about = "run in https reverse proxy mode")]
+    Run(RunArgs),
+    #[clap(version, name = "gen", about = "generate a root ca")]
+    Generate(GenerateArgs),
+}
+
+#[derive(Parser)]
+pub struct RunArgs {
     /// socket address for listening, like 0.0.0.0:443
     #[arg(short, long)]
     pub listen_address: String,
@@ -26,4 +40,23 @@ pub struct Options {
     /// ip address for dns server, like 8.8.8.8
     #[arg(short, long)]
     pub dns_server: String,
+}
+
+#[derive(Parser)]
+pub struct GenerateArgs {}
+
+impl Options {
+    pub fn as_run(&self) -> &RunArgs {
+        match &self.command {
+            Command::Run(args) => args,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn as_generate(&self) -> &GenerateArgs {
+        match &self.command {
+            Command::Generate(args) => args,
+            _ => unreachable!(),
+        }
+    }
 }

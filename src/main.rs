@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::Write;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -6,9 +8,9 @@ use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
-use crate::cert_resolver::DynamicCertificateResolver;
+use crate::cert_resolver::{gen_root_ca, DynamicCertificateResolver};
 use crate::dns_resolver::DnsResolver;
-use crate::options::Options;
+use crate::options::{Command, Options};
 use crate::proxy_conn::ProxyConnection;
 use crate::proxy_manager::ProxyManager;
 use crate::tls_conn::TlsStream;
@@ -23,12 +25,39 @@ mod proxy_manager;
 mod tls_conn;
 mod types;
 
-fn main() -> Result<()> {
+fn main() {
     let options = Options::parse();
-    logger::setup_logger(options.log_file.as_str(), options.log_level)?;
+    logger::setup_logger(options.log_file.as_str(), options.log_level).unwrap();
+    match options.command {
+        Command::Run(_) => {
+            if let Err(err) = run(&options) {
+                log::error!("run failed:{:?}", err);
+            }
+        }
+        Command::Generate(_) => {
+            if let Err(err) = gen(&options) {
+                log::error!("generate failed:{:?}", err);
+            }
+        }
+    }
+}
+
+fn gen(options: &Options) -> Result<()> {
+    let (ca_crt, ca_key) = gen_root_ca()?;
+
+    let mut file = File::create(&options.ca_crt_path)?;
+    file.write_all(ca_crt.as_bytes())?;
+
+    let mut file = File::create(&options.ca_key_path)?;
+    file.write_all(ca_key.as_bytes())?;
+
+    Ok(())
+}
+
+fn run(options: &Options) -> Result<()> {
     let resolver = Arc::new(DynamicCertificateResolver::new(
-        options.ca_crt_path,
-        options.ca_key_path,
+        options.ca_crt_path.clone(),
+        options.ca_key_path.clone(),
     )?);
     let server_config = Arc::new(
         ServerConfig::builder()
@@ -36,6 +65,7 @@ fn main() -> Result<()> {
             .with_no_client_auth()
             .with_cert_resolver(resolver),
     );
+    log::info!("server_config:{:?}", server_config.as_ref());
     let mut root_store = RootCertStore::empty();
     root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
         rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
@@ -50,10 +80,15 @@ fn main() -> Result<()> {
             .with_root_certificates(root_store)
             .with_no_client_auth(),
     );
+    log::info!("client_config:{:?}", client_config.as_ref());
     let mut listener = TcpListener::bind("0.0.0.0:443".parse()?)?;
     let mut poll = Poll::new()?;
     listener.register(poll.registry(), Token(0), Interest::READABLE)?;
-    let mut resolver = DnsResolver::new(options.dns_server.clone(), Token(1), poll.registry())?;
+    let mut resolver = DnsResolver::new(
+        options.as_run().dns_server.clone(),
+        Token(1),
+        poll.registry(),
+    )?;
     let mut manager = ProxyManager::new();
     let mut events = Events::with_capacity(1024);
     let mut index = 2;
@@ -81,7 +116,7 @@ fn main() -> Result<()> {
                     resolver.resolve(&mut manager, poll.registry())?;
                 }
                 i => {
-                    manager.dispatch(i / 2 * 2, &mut resolver);
+                    manager.dispatch(i / 2 * 2, event, poll.registry(), &mut resolver);
                 }
             }
             manager.safe_remove(poll.registry());
