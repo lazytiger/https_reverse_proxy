@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::hash::Hash;
 use std::io::{BufReader, Cursor};
 use std::sync::{Arc, Mutex};
 
 use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa, KeyPair, SanType};
-use rustls::PrivateKey;
-use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
+use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use rustls::PrivateKey;
 use rustls_pemfile::Item;
 
 use crate::types::{Error, Result};
@@ -34,18 +33,27 @@ impl DynamicCertificateResolver {
         let key = KeyPair::from_pem(self.ca_key.as_str())?;
         pem::parse(self.ca_crt.as_str()).unwrap();
         let mut params = CertificateParams::from_ca_cert_pem(self.ca_crt.as_str(), key)?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.subject_alt_names = vec![SanType::DnsName(name.to_string())];
         let signer = Certificate::from_params(params)?;
         let crt = signer.serialize_pem()?;
         let key = signer.serialize_private_key_pem();
-        let certs = rustls_pemfile::certs(&mut Cursor::new(crt.as_bytes()))?.into_iter().map(|cert| rustls::Certificate(cert)).collect();
-        let key = rustls_pemfile::read_all(&mut Cursor::new(key.as_bytes()))?.into_iter().map(|item| {
-            match item {
+        let certs = rustls_pemfile::certs(&mut Cursor::new(crt.as_bytes()))?
+            .into_iter()
+            .map(|cert| rustls::Certificate(cert))
+            .collect();
+        let key = rustls_pemfile::read_all(&mut Cursor::new(key.as_bytes()))?
+            .into_iter()
+            .map(|item| match item {
                 Item::RSAKey(key) => key,
                 Item::PKCS8Key(key) => key,
                 Item::ECKey(key) => key,
                 _ => unreachable!(),
-            }
-        }).map(PrivateKey).map(|key| rustls::sign::any_supported_type(&key)).nth(0).ok_or(Error::PrivateKeyNotFound)??;
+            })
+            .map(PrivateKey)
+            .map(|key| rustls::sign::any_supported_type(&key))
+            .nth(0)
+            .ok_or(Error::PrivateKeyNotFound)??;
         Ok(CertifiedKey::new(certs, key))
     }
 }

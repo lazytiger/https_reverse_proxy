@@ -1,71 +1,88 @@
-use std::collections::HashMap;
-use std::io::{ErrorKind, Write};
 use std::sync::Arc;
 
 use clap::Parser;
-use mio::{Events, Interest, Poll, Token};
 use mio::event::Source;
 use mio::net::TcpListener;
-use rcgen::{CertificateParams, KeyPair};
-use rustls::{ConfigBuilder, ServerConfig, ServerConnection};
+use mio::{Events, Interest, Poll, Token};
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
+use crate::cert_resolver::DynamicCertificateResolver;
+use crate::dns_resolver::DnsResolver;
 use crate::options::Options;
-use crate::resolver::DynamicCertificateResolver;
+use crate::proxy_conn::ProxyConnection;
+use crate::proxy_manager::ProxyManager;
+use crate::tls_conn::TlsStream;
+use crate::types::Result;
 
-mod options;
-mod types;
-mod resolver;
+mod cert_resolver;
+mod dns_resolver;
 mod logger;
+mod options;
+mod proxy_conn;
+mod proxy_manager;
+mod tls_conn;
+mod types;
 
-fn main() {
+fn main() -> Result<()> {
     let options = Options::parse();
-    logger::setup_logger(options.log_file.as_str(), options.log_level).unwrap();
-    let resolver = Arc::new(DynamicCertificateResolver::new(options.ca_crt_path, options.ca_key_path).unwrap());
-    let mut server_config = Arc::new(ServerConfig::builder().with_safe_defaults().with_no_client_auth().with_cert_resolver(resolver.clone()));
-    let mut listener = TcpListener::bind("0.0.0.0:443".parse().unwrap()).unwrap();
-    let mut poll = Poll::new().unwrap();
-    listener.register(poll.registry(), Token(0), Interest::READABLE).unwrap();
+    logger::setup_logger(options.log_file.as_str(), options.log_level)?;
+    let resolver = Arc::new(DynamicCertificateResolver::new(
+        options.ca_crt_path,
+        options.ca_key_path,
+    )?);
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver.clone()),
+    );
+    let mut root_store = RootCertStore::empty();
+    root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+            ta.subject,
+            ta.spki,
+            ta.name_constraints,
+        )
+    }));
+    let client_config = Arc::new(
+        ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    );
+    let mut listener = TcpListener::bind("0.0.0.0:443".parse()?)?;
+    let mut poll = Poll::new()?;
+    listener.register(poll.registry(), Token(0), Interest::READABLE)?;
+    let mut resolver = DnsResolver::new(options.dns_server.clone(), Token(1), poll.registry())?;
+    let mut manager = ProxyManager::new();
     let mut events = Events::with_capacity(1024);
-    let mut index = 1;
-    let mut clients = HashMap::new();
+    let mut index = 2;
     loop {
         poll.poll(&mut events, None).unwrap();
         for event in &events {
             match event.token().0 {
                 0 => {
-                    let (mut client, _) = listener.accept().unwrap();
-                    client.register(poll.registry(), Token(index), Interest::READABLE | Interest::WRITABLE).unwrap();
-                    clients.insert(index, (client, ServerConnection::new(server_config.clone()).unwrap()));
-                    index += 2;
-                }
-                i if i % 2 == 1 => {
-                    println!("found event:{:?}", event);
-                    let (client, session) = clients.get_mut(&i).unwrap();
-                    if event.is_readable() {
-                        loop {
-                            match session.read_tls(client) {
-                               Ok(n)  => {
-                                   println!("read {} bytes", n);
-                               }
-                                Err(err)if err.kind() == ErrorKind::WouldBlock => {
-                                    break;
-                                }
-                                Err(err) => {
-                                    println!("read failed:{}", err);
-                                    break;
-                                }
-                            }
-                        }
-                        session.process_new_packets().unwrap();
-                    }
-                    //session.writer().write("Status 200".as_bytes()).unwrap();
-                    session.write_tls(client).unwrap();
-                    if let Some(name) = session.server_name() {
-                        println!("{} handshake finished", name);
+                    let (client, _) = listener.accept()?;
+                    let conn = ProxyConnection::new(
+                        TlsStream::new_server(client, server_config.clone(), Some(4096))?,
+                        index,
+                        client_config.clone(),
+                        poll.registry(),
+                    )?;
+                    manager.push(index, conn);
+                    index += 1;
+                    if index < 2 {
+                        index = 2;
                     }
                 }
-                _ => {}
+                1 => {
+                    resolver.resolve(&mut manager, poll.registry())?;
+                }
+                i => {
+                    manager.dispatch(i / 2 * 2, &mut resolver);
+                }
             }
+            manager.safe_remove(poll.registry());
         }
     }
 }
