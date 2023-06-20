@@ -116,7 +116,7 @@ fn run(options: &Options) -> Result<()> {
                     resolver.resolve(&mut manager, poll.registry())?;
                 }
                 i => {
-                    manager.dispatch(i / 2 * 2, event, poll.registry(), &mut resolver);
+                    manager.dispatch(i / 2 * 2, &mut resolver);
                 }
             }
             manager.safe_remove(poll.registry());

@@ -130,31 +130,21 @@ impl Source for TlsStream {
 impl Read for TlsStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         debug_assert!(!buf.is_empty());
-        log::info!("read from TlsStream");
         match self.session.reader().read(buf) {
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                log::info!("session has no data, try stream");
                 match self.session.read_tls(&mut self.stream) {
                     Ok(n) if n > 0 => {
-                        log::info!("stream got {} bytes", n);
                         if let Err(err) = self.session.process_new_packets() {
                             Err(Error::new(ErrorKind::InvalidData, err))
                         } else {
-                            log::info!("processed new packets, try read again");
                             self.read(buf)
                         }
                     }
                     Err(err) if is_would_block(&err) => Err(ErrorKind::WouldBlock.into()),
-                    ret => {
-                        log::info!("read_tls return:{:?}", ret);
-                        ret
-                    }
+                    ret => ret,
                 }
             }
-            ret => {
-                log::info!("reader return {:?}", ret);
-                ret
-            }
+            ret => ret,
         }
     }
 }
@@ -166,15 +156,9 @@ impl Write for TlsStream {
             Ok(0) => match self.session.write_tls(&mut self.stream) {
                 Err(err) if is_would_block(&err) => Err(ErrorKind::WouldBlock.into()),
                 Ok(n) if n > 0 => self.write(buf),
-                ret => {
-                    log::info!("write_tls return {:?}", ret);
-                    ret
-                }
+                ret => ret,
             },
-            ret => {
-                log::info!("writer return {:?}", ret);
-                ret
-            }
+            ret => ret,
         }
     }
 
@@ -182,9 +166,7 @@ impl Write for TlsStream {
         let ret = self
             .session
             .write_tls(&mut self.stream)
-            .map(|n| {
-                log::info!("flush {} bytes", n);
-            })
+            .map(|_| {})
             .map_err(|err| {
                 if is_would_block(&err) {
                     ErrorKind::WouldBlock.into()
@@ -192,7 +174,6 @@ impl Write for TlsStream {
                     err
                 }
             });
-        log::info!("flush return:{:?}", ret);
         ret
     }
 }
@@ -221,7 +202,6 @@ impl TlsConnection for TlsStream {
 
     fn handshake(&mut self) -> Result<bool> {
         if self.session.server_name().is_none() {
-            log::info!("handshaking now");
             match self
                 .session
                 .read_tls(&mut self.stream)

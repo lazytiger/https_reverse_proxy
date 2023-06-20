@@ -2,14 +2,13 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use mio::event::Event;
 use mio::net::TcpStream;
 use mio::{Interest, Registry, Token};
 use rustls::{ClientConfig, ServerName};
 
 use crate::dns_resolver::DnsResolver;
 use crate::tls_conn::TlsConnection;
-use crate::types::{from_io_error, is_would_block, Error, Result};
+use crate::types::{Error, Result};
 
 pub struct ProxyConnection<L> {
     local: L,
@@ -105,7 +104,7 @@ where
         }
     }
 
-    pub fn tick(&mut self, event: &Event, registry: &Registry, resolver: &mut DnsResolver) {
+    pub fn tick(&mut self, resolver: &mut DnsResolver) {
         log::info!("connection:{} ticked", self.index);
         if !self.handshake_done {
             match self.local.handshake() {
@@ -202,7 +201,6 @@ where
     W: Write,
 {
     if let Some(remaining) = remaining {
-        log::info!("there is remaining data, send first");
         let n = write_all(writer, remaining.as_slice())?;
         let m = remaining.len();
         if n > 0 && n < m {
@@ -216,7 +214,6 @@ where
         }
     }
     *remaining = None;
-    log::info!("copy started");
     let ret = copy(reader, writer)?;
     *remaining = ret;
     Ok(())

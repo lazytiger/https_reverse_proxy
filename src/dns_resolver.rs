@@ -63,7 +63,6 @@ impl DnsResolver {
                     .iter()
                     .filter_map(|r| r.data().map(|data| data.to_ip_addr()).unwrap_or_default())
                     .collect();
-                log::info!("get dns answer:{} - {:?}", name, data);
                 self.answer.insert(name, data);
             }
         }
