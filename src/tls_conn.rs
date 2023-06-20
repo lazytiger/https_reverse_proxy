@@ -130,6 +130,7 @@ impl Source for TlsStream {
 impl Read for TlsStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         debug_assert!(!buf.is_empty());
+        log::info!("read from TlsStream");
         match self.session.reader().read(buf) {
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 log::info!("session has no data, try stream");
@@ -139,6 +140,7 @@ impl Read for TlsStream {
                         if let Err(err) = self.session.process_new_packets() {
                             Err(Error::new(ErrorKind::InvalidData, err))
                         } else {
+                            log::info!("processed new packets, try read again");
                             self.read(buf)
                         }
                     }

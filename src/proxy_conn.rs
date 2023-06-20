@@ -9,7 +9,7 @@ use rustls::{ClientConfig, ServerName};
 
 use crate::dns_resolver::DnsResolver;
 use crate::tls_conn::TlsConnection;
-use crate::types::{from_io_error, Error, Result};
+use crate::types::{from_io_error, is_would_block, Error, Result};
 
 pub struct ProxyConnection<L> {
     local: L,
@@ -135,6 +135,12 @@ where
         if self.remote.is_some() {
             self.local_to_remote();
             self.remote_to_local();
+            if !self.local_closed {
+                let _ = self.local.flush();
+            }
+            if !self.remote_closed {
+                let _ = self.remote.as_mut().unwrap().flush();
+            }
         }
     }
 
@@ -206,20 +212,13 @@ where
             }
         }
         if !remaining.is_empty() {
-            return if let Err(Some(err)) = writer.flush().map_err(from_io_error) {
-                Err(Error::WriterClosed)
-            } else {
-                Ok(())
-            };
+            return Ok(());
         }
     }
     *remaining = None;
     log::info!("copy started");
     let ret = copy(reader, writer)?;
     *remaining = ret;
-    if let Err(Some(err)) = writer.flush().map_err(from_io_error) {
-        return Err(Error::WriterClosed);
-    }
     Ok(())
 }
 

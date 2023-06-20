@@ -23,7 +23,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub fn from_io_error(err: std::io::Error) -> Option<Error> {
     match err.kind() {
-        ErrorKind::WouldBlock | ErrorKind::NotConnected => None,
+        ErrorKind::WouldBlock | ErrorKind::NotConnected | ErrorKind::Interrupted => None,
         _ => Some(Error::Handshake),
     }
 }
