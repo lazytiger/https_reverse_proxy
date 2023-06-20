@@ -40,6 +40,10 @@ pub struct RunArgs {
     /// ip address for dns server, like 8.8.8.8
     #[arg(short, long)]
     pub dns_server: String,
+
+    /// directory for storing generated certificate
+    #[arg(short, long)]
+    pub certificate_store: String,
 }
 
 #[derive(Parser)]

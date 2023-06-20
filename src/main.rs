@@ -58,6 +58,7 @@ fn run(options: &Options) -> Result<()> {
     let resolver = Arc::new(DynamicCertificateResolver::new(
         options.ca_crt_path.clone(),
         options.ca_key_path.clone(),
+        options.as_run().certificate_store.clone(),
     )?);
     let server_config = Arc::new(
         ServerConfig::builder()

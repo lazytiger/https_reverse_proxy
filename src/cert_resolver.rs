@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::{BufReader, Cursor, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rcgen::{
@@ -18,6 +19,7 @@ pub struct DynamicCertificateResolver {
     ca_crt: String,
     root_ca: Certificate,
     certs: Mutex<HashMap<String, Arc<CertifiedKey>>>,
+    store_path: PathBuf,
 }
 
 pub fn gen_root_ca() -> Result<(String, String)> {
@@ -39,7 +41,7 @@ pub fn gen_root_ca() -> Result<(String, String)> {
 }
 
 impl DynamicCertificateResolver {
-    pub fn new(crt: String, key: String) -> Result<Self> {
+    pub fn new(crt: String, key: String, store_path: String) -> Result<Self> {
         let ca_crt = std::io::read_to_string(&mut BufReader::new(File::open(crt)?))?;
         let ca_key = std::io::read_to_string(&mut BufReader::new(File::open(key)?))?;
         let key = KeyPair::from_pem(ca_key.as_str())?;
@@ -50,6 +52,7 @@ impl DynamicCertificateResolver {
         Ok(Self {
             ca_crt,
             root_ca,
+            store_path: store_path.into(),
             certs: Default::default(),
         })
     }
@@ -69,8 +72,13 @@ impl DynamicCertificateResolver {
         let request_pem = unsigned.serialize_request_pem()?;
         let csr = CertificateSigningRequest::from_pem(&request_pem)?;
         let signed_pem = csr.serialize_pem_with_signer(&self.root_ca)?;
-        let crt = signed_pem + self.ca_crt.as_str();
         let key = unsigned.serialize_private_key_pem();
+        self.save(name, signed_pem.clone(), key.clone())?;
+        self.extract_certificate_key(signed_pem, key)
+    }
+
+    fn extract_certificate_key(&self, crt: String, key: String) -> Result<CertifiedKey> {
+        let crt = crt + self.ca_crt.as_str();
         let certs = rustls_pemfile::certs(&mut Cursor::new(crt.as_bytes()))?
             .into_iter()
             .map(|cert| rustls::Certificate(cert))
@@ -89,6 +97,43 @@ impl DynamicCertificateResolver {
             .ok_or(Error::PrivateKeyNotFound)?;
         Ok(CertifiedKey::new(certs, key))
     }
+
+    fn get_path_and_name(&self, name: &str) -> (PathBuf, PathBuf) {
+        let data = md5::compute(name);
+        let name = format!("{:x}", data);
+        let dir = &name[0..2];
+        let file = &name[2..];
+        log::info!("{} - {}, {}", name, dir, file);
+        (dir.into(), file.into())
+    }
+
+    fn save(&self, name: &str, crt: String, key: String) -> Result<()> {
+        let cert_store = self.store_path.join("certs");
+        let key_store = self.store_path.join("keys");
+        let (dir, file) = self.get_path_and_name(name);
+        let cert_file = cert_store.join(dir.clone()).join(file.clone());
+        std::fs::create_dir_all(cert_file.parent().unwrap())?;
+        let key_file = key_store.join(dir).join(file);
+        std::fs::create_dir_all(key_file.parent().unwrap())?;
+        let mut file = File::create(cert_file)?;
+        file.write_all(crt.as_bytes())?;
+        let mut file = File::create(key_file)?;
+        file.write_all(key.as_bytes())?;
+        Ok(())
+    }
+
+    fn load(&self, name: &str) -> Result<CertifiedKey> {
+        let cert_store = self.store_path.join("certs");
+        let key_store = self.store_path.join("keys");
+        let (dir, file) = self.get_path_and_name(name);
+        let cert_file = cert_store.join(dir.clone()).join(file.clone());
+        let key_file = key_store.join(dir).join(file);
+        let file = File::open(cert_file)?;
+        let crt = std::io::read_to_string(file)?;
+        let file = File::open(key_file)?;
+        let key = std::io::read_to_string(file)?;
+        self.extract_certificate_key(crt, key)
+    }
 }
 
 impl ResolvesServerCert for DynamicCertificateResolver {
@@ -99,11 +144,14 @@ impl ResolvesServerCert for DynamicCertificateResolver {
             ck.clone()
         } else {
             drop(certs);
-            let ret = self.sign(name.as_str());
-            let ck = Arc::new(ret.ok()?);
+            let ck = if let Ok(ck) = self.load(name.as_str()) {
+                ck
+            } else {
+                self.sign(name.as_str()).ok()?
+            };
+            let ck = Arc::new(ck);
             let mut certs = self.certs.lock().ok()?;
             certs.insert(name, ck.clone());
-            //TODO save ck into files
             ck
         };
         Some(ck)
