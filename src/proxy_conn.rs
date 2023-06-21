@@ -126,6 +126,7 @@ where
                     self.local_handshake_done = true;
                     if let Some(server_name) = self.local.server_name() {
                         resolver.query(server_name, self.index).unwrap();
+                        #[cfg(windows)]
                         let _ =
                             self.local
                                 .reregister(registry, Token(self.index), Interest::READABLE);
@@ -141,6 +142,7 @@ where
         if self.remote.is_some() {
             if !self.remote_handshake_done && !self.remote.as_mut().unwrap().is_handshaking() {
                 self.remote_handshake_done = true;
+                #[cfg(windows)]
                 let _ = self.remote.as_mut().unwrap().reregister(
                     registry,
                     Token(self.index + 1),
@@ -203,6 +205,7 @@ where
     }
 }
 
+#[cfg(windows)]
 fn reregister<S>(
     old_remaining: bool,
     new_remaining: bool,
@@ -220,6 +223,20 @@ where
             source.reregister(registry, token, Interest::READABLE)?;
         }
     }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reregister<S>(
+    _old_remaining: bool,
+    _new_remaining: bool,
+    _source: &mut S,
+    _registry: &Registry,
+    _token: Token,
+) -> Result<()>
+where
+    S: Source,
+{
     Ok(())
 }
 
