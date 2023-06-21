@@ -66,7 +66,6 @@ fn run(options: &Options) -> Result<()> {
             .with_no_client_auth()
             .with_cert_resolver(resolver),
     );
-    log::info!("server_config:{:?}", server_config.as_ref());
     let mut root_store = RootCertStore::empty();
     root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
         rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
@@ -81,7 +80,6 @@ fn run(options: &Options) -> Result<()> {
             .with_root_certificates(root_store)
             .with_no_client_auth(),
     );
-    log::info!("client_config:{:?}", client_config.as_ref());
     let mut listener = TcpListener::bind("0.0.0.0:443".parse()?)?;
     let mut poll = Poll::new()?;
     listener.register(poll.registry(), Token(0), Interest::READABLE)?;
@@ -96,7 +94,7 @@ fn run(options: &Options) -> Result<()> {
     loop {
         poll.poll(&mut events, None).unwrap();
         for event in &events {
-            log::info!("event:{:?}", event);
+            log::info!("{:?}", event);
             match event.token().0 {
                 0 => {
                     while let Ok((client, _)) = listener.accept() {
@@ -117,7 +115,7 @@ fn run(options: &Options) -> Result<()> {
                     resolver.resolve(&mut manager, poll.registry())?;
                 }
                 i => {
-                    manager.dispatch(i / 2 * 2, &mut resolver);
+                    manager.dispatch(i / 2 * 2, poll.registry(), &mut resolver);
                 }
             }
             manager.safe_remove(poll.registry());

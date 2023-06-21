@@ -2,6 +2,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use mio::event::Source;
 use mio::net::TcpStream;
 use mio::{Interest, Registry, Token};
 use rustls::{ClientConfig, ServerName};
@@ -15,7 +16,8 @@ pub struct ProxyConnection<L> {
     remote: Option<L>,
     local_remaining: Option<Vec<u8>>,
     remote_remaining: Option<Vec<u8>>,
-    handshake_done: bool,
+    local_handshake_done: bool,
+    remote_handshake_done: bool,
     local_closed: bool,
     remote_closed: bool,
     index: usize,
@@ -42,7 +44,8 @@ where
             remote: None,
             local_remaining: None,
             remote_remaining: None,
-            handshake_done: false,
+            local_handshake_done: false,
+            remote_handshake_done: false,
             local_closed: false,
             remote_closed: false,
             index,
@@ -50,90 +53,102 @@ where
         })
     }
 
-    pub fn local_to_remote(&mut self) {
+    pub fn local_to_remote(&mut self, registry: &Registry) {
         if self.remote_closed {
             return;
         }
-        log::info!("copy local data to remote");
+        let old_remaining = self.local_remaining.is_some();
         match copy_with_remaining(
             &mut self.local_remaining,
             &mut self.local,
             self.remote.as_mut().unwrap(),
         ) {
             Err(Error::ReaderClosed) => {
-                log::info!("local closed");
                 self.local_closed = true;
             }
-            Err(err) => {
-                log::info!("remote closed:{:?}", err);
+            Err(_err) => {
                 self.remote_closed = true;
             }
-            ret => {
-                log::info!("local to remote return:{:?}", ret);
+            Ok(_) => {
+                if let Err(err) = reregister(
+                    old_remaining,
+                    self.local_remaining.is_some(),
+                    self.remote.as_mut().unwrap(),
+                    registry,
+                    Token(self.index + 1),
+                ) {
+                    self.remote_closed = true;
+                    log::error!("remote reregister failed:{:?}", err);
+                }
             }
-        }
-        if self.local_remaining.is_some() {
-            log::info!("send to remote blocked");
         }
     }
 
-    pub fn remote_to_local(&mut self) {
+    pub fn remote_to_local(&mut self, registry: &Registry) {
         if self.local_closed {
             return;
         }
-        log::info!("copy remote data to local");
+        let old_remaining = self.remote_remaining.is_some();
         match copy_with_remaining(
             &mut self.remote_remaining,
             self.remote.as_mut().unwrap(),
             &mut self.local,
         ) {
             Err(Error::ReaderClosed) => {
-                log::info!("remote closed");
                 self.remote_closed = true;
             }
-            Err(err) => {
-                log::info!("local closed:{:?}", err);
+            Err(_) => {
                 self.local_closed = true;
             }
-            ret => {
-                log::info!("remote to local return:{:?}", ret);
+            Ok(_) => {
+                if let Err(err) = reregister(
+                    old_remaining,
+                    self.remote_remaining.is_some(),
+                    &mut self.local,
+                    registry,
+                    Token(self.index),
+                ) {
+                    self.local_closed = true;
+                    log::error!("local reregister failed:{:?}", err);
+                }
             }
-        }
-        if self.remote_remaining.is_some() {
-            log::info!("remote to local blocked");
         }
     }
 
-    pub fn tick(&mut self, resolver: &mut DnsResolver) {
-        log::info!("connection:{} ticked", self.index);
-        if !self.handshake_done {
+    pub fn tick(&mut self, registry: &Registry, resolver: &mut DnsResolver) {
+        if !self.local_handshake_done {
             match self.local.handshake() {
-                Err(err) => {
-                    log::info!("handshake failed:{:?}", err);
+                Err(_) => {
                     self.local_closed = true;
                     self.remote_closed = true;
                 }
                 Ok(true) => {
-                    self.handshake_done = true;
-                    log::info!("is_handshaking:{}", self.local.is_handshaking());
+                    self.local_handshake_done = true;
                     if let Some(server_name) = self.local.server_name() {
-                        log::info!("get server_name:{}", server_name);
                         resolver.query(server_name, self.index).unwrap();
+                        let _ =
+                            self.local
+                                .reregister(registry, Token(self.index), Interest::READABLE);
                     } else {
-                        log::error!("no server name found");
                         self.local_closed = true;
                         self.remote_closed = true;
                     }
                 }
-                _ => {
-                    log::info!("handshake not done");
-                }
+                _ => {}
             }
         }
 
         if self.remote.is_some() {
-            self.local_to_remote();
-            self.remote_to_local();
+            if !self.remote_handshake_done && !self.remote.as_mut().unwrap().is_handshaking() {
+                self.remote_handshake_done = true;
+                let _ = self.remote.as_mut().unwrap().reregister(
+                    registry,
+                    Token(self.index + 1),
+                    Interest::READABLE,
+                );
+            }
+            self.local_to_remote(registry);
+            self.remote_to_local(registry);
             if !self.local_closed {
                 let _ = self.local.flush();
             }
@@ -147,7 +162,6 @@ where
         let ip = ips.get(0).ok_or(Error::DnsQuery)?;
         let addr = SocketAddr::new(*ip, 443);
         let stream = TcpStream::connect(addr)?;
-        log::info!("connection to {}", addr);
         let mut remote = self.local.new_client_with_stream(
             stream,
             self.config.clone(),
@@ -163,14 +177,12 @@ where
     }
 
     pub fn resolved(&mut self, ips: &Vec<IpAddr>, registry: &Registry) {
-        if let Err(err) = self.connect_to_remote(ips, registry) {
-            log::error!("connect to remote:{:?} failed:{:?}", ips, err);
+        if let Err(_) = self.connect_to_remote(ips, registry) {
             self.remote_closed = true;
             self.local_closed = true;
         } else {
-            log::info!("do transfer now");
-            self.local_to_remote();
-            self.remote_to_local();
+            self.local_to_remote(registry);
+            self.remote_to_local(registry);
         }
     }
 
@@ -189,6 +201,26 @@ where
             let _ = remote.deregister(registry);
         }
     }
+}
+
+fn reregister<S>(
+    old_remaining: bool,
+    new_remaining: bool,
+    source: &mut S,
+    registry: &Registry,
+    token: Token,
+) -> Result<()>
+where
+    S: Source,
+{
+    if old_remaining != new_remaining {
+        if new_remaining {
+            source.reregister(registry, token, Interest::WRITABLE | Interest::READABLE)?;
+        } else {
+            source.reregister(registry, token, Interest::READABLE)?;
+        }
+    }
+    Ok(())
 }
 
 fn copy_with_remaining<R, W>(
