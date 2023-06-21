@@ -299,7 +299,6 @@ fn write_all<W>(writer: &mut W, mut data: &[u8]) -> Result<usize>
 where
     W: Write,
 {
-    log::info!("{}", String::from_utf8_lossy(data));
     let mut len = 0;
     loop {
         match writer.write(data) {

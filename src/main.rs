@@ -94,7 +94,6 @@ fn run(options: &Options) -> Result<()> {
     loop {
         poll.poll(&mut events, None).unwrap();
         for event in &events {
-            log::info!("{:?}", event);
             match event.token().0 {
                 0 => {
                     while let Ok((client, _)) = listener.accept() {

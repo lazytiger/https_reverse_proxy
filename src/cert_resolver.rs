@@ -103,7 +103,6 @@ impl DynamicCertificateResolver {
         let name = format!("{:x}", data);
         let dir = &name[0..2];
         let file = &name[2..];
-        log::info!("{} - {}, {}", name, dir, file);
         (dir.into(), file.into())
     }
 
