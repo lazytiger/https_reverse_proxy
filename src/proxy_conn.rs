@@ -57,11 +57,14 @@ where
         if self.remote_closed {
             return;
         }
-        let old_remaining = self.local_remaining.is_some();
+        let old_remaining =
+            self.local_remaining.is_some() || self.remote.as_mut().unwrap().wants_write();
+        let mut content = None;
         match copy_with_remaining(
             &mut self.local_remaining,
             &mut self.local,
             self.remote.as_mut().unwrap(),
+            &mut content,
         ) {
             Err(Error::ReaderClosed) => {
                 self.local_closed = true;
@@ -72,7 +75,7 @@ where
             Ok(_) => {
                 if let Err(err) = reregister(
                     old_remaining,
-                    self.local_remaining.is_some(),
+                    self.local_remaining.is_some() || self.remote.as_mut().unwrap().wants_write(),
                     self.remote.as_mut().unwrap(),
                     registry,
                     Token(self.index + 1),
@@ -88,11 +91,13 @@ where
         if self.local_closed {
             return;
         }
-        let old_remaining = self.remote_remaining.is_some();
+        let old_remaining = self.remote_remaining.is_some() || self.local.wants_write();
+        let mut content = None;
         match copy_with_remaining(
             &mut self.remote_remaining,
             self.remote.as_mut().unwrap(),
             &mut self.local,
+            &mut content,
         ) {
             Err(Error::ReaderClosed) => {
                 self.remote_closed = true;
@@ -103,7 +108,7 @@ where
             Ok(_) => {
                 if let Err(err) = reregister(
                     old_remaining,
-                    self.remote_remaining.is_some(),
+                    self.remote_remaining.is_some() || self.local.wants_write(),
                     &mut self.local,
                     registry,
                     Token(self.index),
@@ -140,9 +145,9 @@ where
         }
 
         if self.remote.is_some() {
+            #[cfg(windows)]
             if !self.remote_handshake_done && !self.remote.as_mut().unwrap().is_handshaking() {
                 self.remote_handshake_done = true;
-                #[cfg(windows)]
                 let _ = self.remote.as_mut().unwrap().reregister(
                     registry,
                     Token(self.index + 1),
@@ -244,6 +249,7 @@ fn copy_with_remaining<R, W>(
     remaining: &mut Option<Vec<u8>>,
     reader: &mut R,
     writer: &mut W,
+    content: &mut Option<Vec<u8>>,
 ) -> Result<()>
 where
     R: Read,
@@ -263,12 +269,16 @@ where
         }
     }
     *remaining = None;
-    let ret = copy(reader, writer)?;
+    let ret = copy(reader, writer, content)?;
     *remaining = ret;
     Ok(())
 }
 
-fn copy<R, W>(reader: &mut R, writer: &mut W) -> Result<Option<Vec<u8>>>
+fn copy<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    content: &mut Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>>
 where
     R: Read,
     W: Write,
@@ -277,18 +287,23 @@ where
     loop {
         match reader.read(buffer.as_mut_slice()) {
             Ok(0) => return Err(Error::ReaderClosed),
-            Ok(n) => match write_all(writer, &buffer.as_slice()[..n]) {
-                Ok(m) => {
-                    if m < n {
-                        buffer.copy_within(m..n, 0);
-                        unsafe {
-                            buffer.set_len(n - m);
-                        }
-                        return Ok(Some(buffer));
-                    }
+            Ok(n) => {
+                if let Some(content) = content {
+                    content.extend_from_slice(&buffer.as_slice()[..n]);
                 }
-                Err(err) => return Err(err),
-            },
+                match write_all(writer, &buffer.as_slice()[..n]) {
+                    Ok(m) => {
+                        if m < n {
+                            buffer.copy_within(m..n, 0);
+                            unsafe {
+                                buffer.set_len(n - m);
+                            }
+                            return Ok(Some(buffer));
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
             Err(err) if err.kind() == ErrorKind::WouldBlock => return Ok(None),
             Err(_) => return Err(Error::ReaderClosed),
         }

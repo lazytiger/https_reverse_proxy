@@ -1,8 +1,8 @@
 use std::io::ErrorKind;
 
-use derive_more::From;
+use derive_more::{Display, Error, From};
 
-#[derive(From, Debug)]
+#[derive(From, Debug, Error, Display)]
 pub enum Error {
     StdIo(std::io::Error),
     Rcgen(rcgen::RcgenError),
@@ -17,6 +17,10 @@ pub enum Error {
     StdNetAddrParse(std::net::AddrParseError),
     TrustDnsProto(trust_dns_proto::error::ProtoError),
     RustClientInvalidDnsName(rustls::client::InvalidDnsNameError),
+    ReadLock,
+    WriteLock,
+    Eof,
+    TokioJoin(tokio::task::JoinError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

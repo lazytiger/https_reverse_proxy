@@ -1,4 +1,5 @@
 use std::io::{Error, ErrorKind, Read, Write};
+use std::net::Shutdown;
 use std::sync::Arc;
 
 use mio::event::Source;
@@ -64,6 +65,24 @@ impl TlsSession {
             TlsSession::Client(_) => None,
         }
     }
+
+    pub fn wants_write(&self) -> bool {
+        match self {
+            TlsSession::Server(conn) => conn.wants_write(),
+            TlsSession::Client(conn) => conn.wants_write(),
+        }
+    }
+
+    pub fn send_close_notify(&mut self) {
+        match self {
+            TlsSession::Server(conn) => {
+                conn.send_close_notify();
+            }
+            TlsSession::Client(conn) => {
+                conn.send_close_notify();
+            }
+        }
+    }
 }
 
 pub struct TlsStream {
@@ -100,6 +119,11 @@ impl TlsStream {
             session: TlsSession::Client(session),
             buffer_limit,
         })
+    }
+
+    pub fn shutdown(&mut self) -> std::io::Result<()> {
+        self.session.send_close_notify();
+        self.stream.shutdown(Shutdown::Both)
     }
 }
 
@@ -193,6 +217,7 @@ pub trait TlsConnection: Read + Write + Source + Sized {
         config: Arc<ServerConfig>,
     ) -> Result<Self>;
     fn is_handshaking(&self) -> bool;
+    fn wants_write(&self) -> bool;
 }
 
 impl TlsConnection for TlsStream {
@@ -243,5 +268,9 @@ impl TlsConnection for TlsStream {
 
     fn is_handshaking(&self) -> bool {
         self.session.is_handshaking()
+    }
+
+    fn wants_write(&self) -> bool {
+        self.session.wants_write()
     }
 }

@@ -21,3 +21,5 @@ chrono = "0.4"
 trust-dns-proto = "0.22"
 webpki-roots = "0.23"
 md5 = "0.7"
+hyper = { version = "0.14", features = ["full"] }
+tokio = { version = "1.27", features = [] }

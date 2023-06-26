@@ -7,7 +7,9 @@ use mio::event::Source;
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use tokio::runtime::Runtime;
 
+use crate::acceptor::{build, TlsPoll};
 use crate::cert_resolver::{gen_root_ca, DynamicCertificateResolver};
 use crate::dns_resolver::DnsResolver;
 use crate::options::{Command, Options};
@@ -16,6 +18,7 @@ use crate::proxy_manager::ProxyManager;
 use crate::tls_conn::TlsStream;
 use crate::types::Result;
 
+mod acceptor;
 mod cert_resolver;
 mod dns_resolver;
 mod logger;
@@ -30,7 +33,7 @@ fn main() {
     logger::setup_logger(options.log_file.as_str(), options.log_level).unwrap();
     match options.command {
         Command::Run(_) => {
-            if let Err(err) = run(&options) {
+            if let Err(err) = hyper(options) {
                 log::error!("run failed:{:?}", err);
             }
         }
@@ -91,8 +94,7 @@ fn run(options: &Options) -> Result<()> {
     let mut manager = ProxyManager::new();
     let mut events = Events::with_capacity(1024);
     let mut index = 2;
-    loop {
-        poll.poll(&mut events, None).unwrap();
+    while let Ok(()) = poll.poll(&mut events, None) {
         for event in &events {
             match event.token().0 {
                 0 => {
@@ -120,4 +122,12 @@ fn run(options: &Options) -> Result<()> {
             manager.safe_remove(poll.registry());
         }
     }
+    Ok(())
+}
+
+fn hyper(options: Options) -> Result<()> {
+    let mut listener = TcpListener::bind("0.0.0.0:443".parse()?)?;
+    let runtime = Runtime::new()?;
+    let _ = runtime.block_on(build(listener, options))?;
+    Ok(())
 }
