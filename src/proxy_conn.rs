@@ -17,6 +17,7 @@ pub struct ProxyConnection<L> {
     local_remaining: Option<Vec<u8>>,
     remote_remaining: Option<Vec<u8>>,
     local_handshake_done: bool,
+    #[cfg(windows)]
     remote_handshake_done: bool,
     local_closed: bool,
     remote_closed: bool,

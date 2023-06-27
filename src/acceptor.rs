@@ -343,7 +343,12 @@ async fn do_response(url: String, resp: &mut Response<Body>) -> types::Result<()
         std::fs::create_dir_all(&dir)?;
         let name = dir.join(name);
         if !name.is_file() {
-            let mut file = OpenOptions::new().create_new(true).open(&name).await?;
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .append(true)
+                .open(&name)
+                .await?;
             while let Some(data) = resp.body_mut().next().await {
                 let ok = if let Ok(mut data) = data {
                     file.write_all_buf(&mut data).await.is_ok()
