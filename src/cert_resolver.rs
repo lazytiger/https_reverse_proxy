@@ -14,6 +14,7 @@ use rustls::PrivateKey;
 use rustls_pemfile::Item;
 
 use crate::types::{Error, Result};
+use crate::utils;
 
 pub struct DynamicCertificateResolver {
     ca_crt: String,
@@ -98,18 +99,10 @@ impl DynamicCertificateResolver {
         Ok(CertifiedKey::new(certs, key))
     }
 
-    fn get_path_and_name(&self, name: &str) -> (PathBuf, PathBuf) {
-        let data = md5::compute(name);
-        let name = format!("{:x}", data);
-        let dir = &name[0..2];
-        let file = &name[2..];
-        (dir.into(), file.into())
-    }
-
     fn save(&self, name: &str, crt: String, key: String) -> Result<()> {
         let cert_store = self.store_path.join("certs");
         let key_store = self.store_path.join("keys");
-        let (dir, file) = self.get_path_and_name(name);
+        let (dir, file) = utils::get_path_and_name(name, 2);
         let cert_file = cert_store.join(dir.clone()).join(file.clone());
         std::fs::create_dir_all(cert_file.parent().unwrap())?;
         let key_file = key_store.join(dir).join(file);
@@ -124,7 +117,7 @@ impl DynamicCertificateResolver {
     fn load(&self, name: &str) -> Result<CertifiedKey> {
         let cert_store = self.store_path.join("certs");
         let key_store = self.store_path.join("keys");
-        let (dir, file) = self.get_path_and_name(name);
+        let (dir, file) = utils::get_path_and_name(name, 2);
         let cert_file = cert_store.join(dir.clone()).join(file.clone());
         let key_file = key_store.join(dir).join(file);
         let file = File::open(cert_file)?;

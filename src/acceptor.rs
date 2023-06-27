@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use futures_util::stream::StreamExt;
 use hyper::client::HttpConnector;
 use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
@@ -15,12 +17,12 @@ use mio::event::Source;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Poll as MPoll, Token};
 use rustls::ServerConfig;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::cert_resolver::DynamicCertificateResolver;
-use crate::options::Options;
 use crate::tls_conn::TlsStream;
-use crate::types;
+use crate::{options, types, utils};
 
 #[derive(Clone)]
 pub struct TlsPoll {
@@ -321,27 +323,54 @@ async fn do_request(mut req: Request<Body>) -> types::Result<Response<Body>> {
     let url = format!("https://{}{}", host, query);
     *req.uri_mut() = Uri::from_str(url.as_str())?;
     let mut resp = CLIENT.request(req).await?;
-    if let Err(err) = do_response(&mut resp).await {
+    if let Err(err) = do_response(url.clone(), &mut resp).await {
         log::error!("do_response for url:{} failed:{}", url, err);
     }
     Ok(resp)
 }
 
-async fn do_response(resp: &mut Response<Body>) -> types::Result<()> {
+async fn do_response(url: String, resp: &mut Response<Body>) -> types::Result<()> {
     let content_type = resp
         .headers()
         .get(http::header::CONTENT_TYPE)
         .ok_or(types::Error::NoContentType)?
-        .to_str()?;
-    log::info!("content_type:{}", content_type);
+        .to_str()?
+        .to_string();
+    if options().as_run().content_types.contains(&content_type) {
+        let (path, name) = utils::get_path_and_name(url.as_str(), 3);
+        let root = PathBuf::from(options().as_run().cache_store.clone());
+        let dir = root.join(path);
+        std::fs::create_dir_all(&dir)?;
+        let name = dir.join(name);
+        if !name.is_file() {
+            let mut file = OpenOptions::new().create_new(true).open(&name).await?;
+            while let Some(data) = resp.body_mut().next().await {
+                let ok = if let Ok(mut data) = data {
+                    file.write_all_buf(&mut data).await.is_ok()
+                } else {
+                    false
+                };
+                if !ok {
+                    drop(file);
+                    std::fs::remove_file(&name)?;
+                    return Ok(());
+                }
+            }
+        }
+        if name.is_file() {
+            log::info!("cache found");
+            let file = FileStream::new(&name).await?;
+            *resp.body_mut() = Body::wrap_stream(file);
+        }
+    }
     Ok(())
 }
 
-pub async fn run(listener: TcpListener, options: Options) -> types::Result<()> {
+pub async fn run(listener: TcpListener) -> types::Result<()> {
     let resolver = Arc::new(DynamicCertificateResolver::new(
-        options.ca_crt_path.clone(),
-        options.ca_key_path.clone(),
-        options.as_run().certificate_store.clone(),
+        options().ca_crt_path.clone(),
+        options().ca_key_path.clone(),
+        options().as_run().certificate_store.clone(),
     )?);
     let config = Arc::new(
         ServerConfig::builder()
@@ -385,7 +414,7 @@ pub struct FileStream {
 }
 
 impl FileStream {
-    pub async fn new(name: &str) -> types::Result<FileStream> {
+    pub async fn new(name: impl AsRef<Path>) -> types::Result<FileStream> {
         let file = tokio::fs::File::open(name).await?;
         Ok(Self { file })
     }

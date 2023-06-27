@@ -30,11 +30,34 @@ pub enum Command {
     #[clap(version, name = "gen", about = "generate a root ca")]
     Generate(GenerateArgs),
     #[clap(version, name = "proxy", about = "run in proxy mode")]
-    Proxy(RunArgs),
+    Proxy(ProxyArgs),
 }
 
 #[derive(Parser)]
 pub struct RunArgs {
+    /// socket address for listening, like 0.0.0.0:443
+    #[arg(short, long)]
+    pub listen_address: String,
+
+    /// ip address for dns server, like 8.8.8.8
+    #[arg(short, long)]
+    pub dns_server: String,
+
+    /// directory for storing generated certificate
+    #[arg(short, long)]
+    pub certificate_store: String,
+
+    /// directory for storing cached data
+    #[arg(short = 'C', long)]
+    pub cache_store: String,
+
+    /// a list of content-type which will be cached
+    #[arg(short = 't', long)]
+    pub content_types: Vec<String>,
+}
+
+#[derive(Parser)]
+pub struct ProxyArgs {
     /// socket address for listening, like 0.0.0.0:443
     #[arg(short, long)]
     pub listen_address: String,
@@ -67,7 +90,7 @@ impl Options {
         }
     }
 
-    pub fn as_proxy(&self) -> &RunArgs {
+    pub fn as_proxy(&self) -> &ProxyArgs {
         match &self.command {
             Command::Proxy(args) => args,
             _ => unreachable!(),
