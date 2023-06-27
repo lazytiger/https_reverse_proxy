@@ -1,6 +1,7 @@
 use std::io::ErrorKind;
 
 use derive_more::{Display, Error, From};
+use hyper::http;
 
 #[derive(From, Debug, Error, Display)]
 pub enum Error {
@@ -20,7 +21,12 @@ pub enum Error {
     ReadLock,
     WriteLock,
     Eof,
+    NoHostName,
+    NoPathAndQuery,
+    HttpHeaderToStr(http::header::ToStrError),
     TokioJoin(tokio::task::JoinError),
+    Hyper(hyper::Error),
+    InvalidUri(http::uri::InvalidUri),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

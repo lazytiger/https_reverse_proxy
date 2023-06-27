@@ -1,19 +1,24 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{Error, ErrorKind, Read, Write};
+use std::mem::ManuallyDrop;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use hyper::client::HttpConnector;
 use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Response};
+use hyper::{http, Body, Client, Request, Response, Uri};
+use hyper_rustls::HttpsConnector;
+use lazy_static::lazy_static;
 use mio::event::Source;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Poll as MPoll, Token};
 use rustls::{ServerConfig, ServerConnection};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 use crate::cert_resolver::DynamicCertificateResolver;
 use crate::options::Options;
@@ -47,6 +52,8 @@ impl TlsPoll {
             .map_err(|_| types::Error::ReadLock)?;
         if let Some(waker) = lock.get(&token) {
             waker.wake_by_ref();
+        } else {
+            log::info!("read waker for connection:{} not found", token.0);
         }
         Ok(())
     }
@@ -58,6 +65,8 @@ impl TlsPoll {
             .map_err(|_| types::Error::ReadLock)?;
         if let Some(waker) = lock.get(&token) {
             waker.wake_by_ref();
+        } else {
+            //log::warn!("write waker for connection:{} not found", token.0);
         }
         Ok(())
     }
@@ -69,6 +78,8 @@ impl TlsPoll {
             .map_err(|_| types::Error::ReadLock)?;
         if let Some(waker) = lock.get(&token) {
             waker.wake_by_ref();
+        } else {
+            log::warn!("flush waker for connection:{} not found", token.0);
         }
         Ok(())
     }
@@ -175,7 +186,7 @@ impl Accept for TlsAcceptor {
                 pin.next_token += 1;
                 match HttpsConnection::new(pin.poll.clone(), token, stream, pin.config.clone()) {
                     Ok(conn) => {
-                        log::info!("new connection found");
+                        log::info!("new connection created");
                         Poll::Ready(Some(Ok(conn)))
                     }
                     Err(err) => {
@@ -184,7 +195,10 @@ impl Accept for TlsAcceptor {
                     }
                 }
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                log::info!("accept blocked");
+                Poll::Pending
+            }
             Err(err) => Poll::Ready(Some(Err(err.into()))),
         }
     }
@@ -231,6 +245,7 @@ impl AsyncRead for HttpsConnection {
             Ok(n) => {
                 offset += n;
                 buf.set_filled(offset);
+                //cx.waker().wake_by_ref();
                 Poll::Ready(Ok(()))
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
@@ -248,7 +263,10 @@ impl AsyncWrite for HttpsConnection {
         let pin = self.get_mut();
         let _ = pin.poll.set_write_waker(pin.token, cx.waker().clone());
         match pin.stream.write(buf) {
-            Ok(n) => Poll::Ready(Ok(n)),
+            Ok(n) => {
+                //cx.waker().wake_by_ref();
+                Poll::Ready(Ok(n))
+            }
             Err(err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
             Err(err) => Poll::Ready(Err(err.into())),
         }
@@ -256,8 +274,12 @@ impl AsyncWrite for HttpsConnection {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let pin = self.get_mut();
+        let _ = pin.poll.set_flush_waker(pin.token, cx.waker().clone());
         match pin.stream.flush() {
-            Ok(_) => Poll::Ready(Ok(())),
+            Ok(_) => {
+                //cx.waker().wake_by_ref();
+                Poll::Ready(Ok(()))
+            }
             Err(err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
             Err(err) => Poll::Ready(Err(err.into())),
         }
@@ -268,6 +290,41 @@ impl AsyncWrite for HttpsConnection {
         let _ = pin.stream.shutdown();
         Poll::Ready(Ok(()))
     }
+}
+
+lazy_static::lazy_static! {
+    static ref CLIENT:Client<HttpsConnector<HttpConnector>, Body> = {
+       let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .https_only()
+        .enable_http1()
+        .build();
+        Client::builder().build(https)
+    };
+}
+
+async fn do_request(mut req: Request<Body>) -> types::Result<Response<Body>> {
+    let host = req
+        .headers()
+        .get(http::header::HOST)
+        .ok_or(types::Error::NoHostName)?
+        .to_str()?;
+    let query = req
+        .uri()
+        .path_and_query()
+        .ok_or(types::Error::NoPathAndQuery)?
+        .as_str();
+    let url = format!("https://{}/{}", host, query);
+    log::info!("url:{}", url);
+    *req.uri_mut() = Uri::from_str(url.as_str())?;
+    let resp = CLIENT.request(req).await;
+    if let Ok(resp) = &resp {
+        log::info!(
+            "content-type:{:?}",
+            resp.headers().get(http::header::CONTENT_TYPE)
+        );
+    }
+    Ok(resp?)
 }
 
 pub async fn build(listener: TcpListener, options: Options) -> types::Result<()> {
@@ -283,20 +340,13 @@ pub async fn build(listener: TcpListener, options: Options) -> types::Result<()>
             .with_cert_resolver(resolver),
     );
     let poll = TlsPoll::new().unwrap();
+
     let builder = hyper::server::Server::builder(TlsAcceptor::new(listener, config, poll.clone())?);
-    let make_server = make_service_fn(|conn: &HttpsConnection| {
-        let server_name = conn.stream.server_name().unwrap_or("").to_string();
-        log::info!("server_name:{}", server_name);
-        async move {
-            Ok::<_, types::Error>(service_fn(|req| async move {
-                log::info!("uri:{}", req.uri());
-                log::info!("header:{:?}", req.headers());
-                Ok::<_, types::Error>(Response::new(Body::from("Hello, World!")))
-            }))
-        }
+    let make_server = make_service_fn(|conn: &HttpsConnection| async move {
+        Ok::<_, types::Error>(service_fn(do_request))
     });
 
-    let server = builder.serve(make_server);
+    let server = builder.http1_keepalive(true).serve(make_server);
 
     std::thread::spawn(move || {
         log::info!("mio thread started");
@@ -311,10 +361,39 @@ pub async fn build(listener: TcpListener, options: Options) -> types::Result<()>
                     let _ = poll.wake_flush(event.token());
                 }
             }
+            std::thread::sleep(Duration::from_millis(1));
         }
     });
     if let Err(err) = server.await {
         log::error!("server exit:{}", err);
     }
     Ok(())
+}
+
+pub struct FileStream {
+    file: tokio::fs::File,
+}
+
+impl futures_core::Stream for FileStream {
+    type Item = types::Result<Vec<u8>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut data = vec![0u8; 1024];
+        let mut buf = ReadBuf::new(data.as_mut_slice());
+        match Pin::new(&mut self.file).poll_read(cx, &mut buf) {
+            Poll::Ready(Ok(_)) => {
+                unsafe {
+                    let len = buf.filled().len();
+                    data.set_len(len);
+                }
+                Poll::Ready(Some(Ok(data)))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err.into()))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn test(f: FileStream) {
+    let body = Body::wrap_stream(f);
 }
