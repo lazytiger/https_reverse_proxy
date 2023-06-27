@@ -381,8 +381,8 @@ async fn do_response(
                 //log::info!("read from body");
                 let ok = if let Ok(mut data) = data {
                     log::info!("save {} bytes to file:{}", data.len(), tmp_file);
+                    length += len;
                     let ok = file.write_all_buf(&mut data).await.is_ok();
-                    length += data.len();
                     ok
                 } else {
                     false
