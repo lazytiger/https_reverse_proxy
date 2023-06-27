@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Error, ErrorKind, Read, Write};
+use std::io::{Error, ErrorKind, Read, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -9,16 +9,17 @@ use std::time::Duration;
 
 use futures_util::stream::StreamExt;
 use hyper::client::HttpConnector;
+use hyper::http::HeaderName;
 use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{http, Body, Client, Request, Response, Uri};
+use hyper::{http, Body, Client, HeaderMap, Request, Response, Uri};
 use hyper_rustls::HttpsConnector;
 use mio::event::Source;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Poll as MPoll, Token};
 use rustls::ServerConfig;
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::cert_resolver::DynamicCertificateResolver;
 use crate::tls_conn::TlsStream;
@@ -321,52 +322,91 @@ async fn do_request(mut req: Request<Body>) -> types::Result<Response<Body>> {
         .ok_or(types::Error::NoPathAndQuery)?
         .as_str();
     let url = format!("https://{}{}", host, query);
+    let range = get_header_value(req.headers(), http::header::RANGE, 0usize);
     *req.uri_mut() = Uri::from_str(url.as_str())?;
     let mut resp = CLIENT.request(req).await?;
-    if let Err(err) = do_response(url.clone(), &mut resp).await {
+    let content_length = get_header_value(resp.headers(), http::header::CONTENT_LENGTH, 0usize);
+    if let Err(err) = do_response(range, content_length, url.clone(), &mut resp).await {
         log::error!("do_response for url:{} failed:{}", url, err);
     }
     Ok(resp)
 }
 
-async fn do_response(url: String, resp: &mut Response<Body>) -> types::Result<()> {
-    let content_type = resp
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .ok_or(types::Error::NoContentType)?
-        .to_str()?
-        .to_string();
+fn get_header_value<T>(headers: &HeaderMap, key: HeaderName, dft: T) -> T
+where
+    T: Clone,
+    T: FromStr,
+{
+    headers
+        .get(key)
+        .map(|header| header.to_str().map(|s| s.parse()))
+        .unwrap_or(Ok(Ok(dft.clone())))
+        .unwrap_or(Ok(dft.clone()))
+        .unwrap_or(dft)
+}
+
+async fn do_response(
+    range: usize,
+    content_length: usize,
+    url: String,
+    resp: &mut Response<Body>,
+) -> types::Result<()> {
+    let content_type = get_header_value(resp.headers(), http::header::CONTENT_TYPE, "".to_string());
+    log::info!(
+        "content-type:{}, content-length:{}, range:{}",
+        content_type,
+        content_length,
+        range
+    );
     if options().as_run().content_types.contains(&content_type) {
         let (path, name) = utils::get_path_and_name(url.as_str(), 3);
         let root = PathBuf::from(options().as_run().cache_store.clone());
         let dir = root.join(path);
         std::fs::create_dir_all(&dir)?;
         let name = dir.join(name);
-        if !name.is_file() {
+        if !name.is_file() && range == 0 {
+            let tmp_file = name.to_string_lossy().to_string() + ".tmp";
             let mut file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .append(true)
-                .open(&name)
+                .open(&tmp_file)
                 .await?;
+            log::info!("cache not found, save response now");
+            let mut length = 0;
             while let Some(data) = resp.body_mut().next().await {
+                //log::info!("read from body");
                 let ok = if let Ok(mut data) = data {
-                    file.write_all_buf(&mut data).await.is_ok()
+                    log::info!("save {} bytes to file:{}", data.len(), tmp_file);
+                    let ok = file.write_all_buf(&mut data).await.is_ok();
+                    length += data.len();
+                    ok
                 } else {
                     false
                 };
                 if !ok {
                     drop(file);
-                    std::fs::remove_file(&name)?;
+                    std::fs::remove_file(&tmp_file)?;
                     return Ok(());
                 }
             }
+            if length != content_length {
+                log::info!("content-length is not match:{}-{}", length, content_length);
+                drop(file);
+                std::fs::remove_file(&tmp_file)?;
+                return Ok(());
+            }
+            file.flush().await?;
+            drop(file);
+            std::fs::rename(&tmp_file, &name)?;
         }
         if name.is_file() {
             log::info!("cache found");
-            let file = FileStream::new(&name).await?;
+            let file = FileStream::new(&name, range).await?;
             *resp.body_mut() = Body::wrap_stream(file);
         }
+    } else {
+        log::info!("content-type:{} ignored", content_type);
     }
     Ok(())
 }
@@ -419,8 +459,9 @@ pub struct FileStream {
 }
 
 impl FileStream {
-    pub async fn new(name: impl AsRef<Path>) -> types::Result<FileStream> {
-        let file = tokio::fs::File::open(name).await?;
+    pub async fn new(name: impl AsRef<Path>, range: usize) -> types::Result<FileStream> {
+        let mut file = tokio::fs::File::open(name).await?;
+        file.seek(SeekFrom::Start(range as u64)).await?;
         Ok(Self { file })
     }
 }

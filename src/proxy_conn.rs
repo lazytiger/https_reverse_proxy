@@ -46,6 +46,7 @@ where
             local_remaining: None,
             remote_remaining: None,
             local_handshake_done: false,
+            #[cfg(windows)]
             remote_handshake_done: false,
             local_closed: false,
             remote_closed: false,

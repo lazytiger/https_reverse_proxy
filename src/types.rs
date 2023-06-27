@@ -25,7 +25,6 @@ pub enum Error {
     NoHostName,
     ReaderClosed,
     WriterClosed,
-    NoContentType,
     NoPathAndQuery,
     PrivateKeyNotFound,
 }
