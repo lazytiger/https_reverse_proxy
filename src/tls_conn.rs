@@ -161,7 +161,6 @@ impl Read for TlsStream {
                         if let Err(err) = self.session.process_new_packets() {
                             Err(Error::new(ErrorKind::InvalidData, err))
                         } else {
-                            log::info!("read {} bytes from stream", n);
                             self.read(buf)
                         }
                     }
@@ -191,11 +190,7 @@ impl Write for TlsStream {
         let ret = self
             .session
             .write_tls(&mut self.stream)
-            .map(|n| {
-                if n > 0 {
-                    log::info!("flush {} bytes to stream", n);
-                }
-            })
+            .map(|_n| {})
             .map_err(|err| {
                 if is_would_block(&err) {
                     ErrorKind::WouldBlock.into()

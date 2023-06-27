@@ -9,7 +9,6 @@ use mio::{Events, Interest, Poll, Token};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::runtime::Runtime;
 
-use crate::acceptor::{build, TlsPoll};
 use crate::cert_resolver::{gen_root_ca, DynamicCertificateResolver};
 use crate::dns_resolver::DnsResolver;
 use crate::options::{Command, Options};
@@ -33,8 +32,13 @@ fn main() {
     logger::setup_logger(options.log_file.as_str(), options.log_level).unwrap();
     match options.command {
         Command::Run(_) => {
-            if let Err(err) = hyper(options) {
+            if let Err(err) = run(options) {
                 log::error!("run failed:{:?}", err);
+            }
+        }
+        Command::Proxy(_) => {
+            if let Err(err) = proxy(&options) {
+                log::error!("proxy failed:{:?}", err);
             }
         }
         Command::Generate(_) => {
@@ -57,11 +61,11 @@ fn gen(options: &Options) -> Result<()> {
     Ok(())
 }
 
-fn run(options: &Options) -> Result<()> {
+fn proxy(options: &Options) -> Result<()> {
     let resolver = Arc::new(DynamicCertificateResolver::new(
         options.ca_crt_path.clone(),
         options.ca_key_path.clone(),
-        options.as_run().certificate_store.clone(),
+        options.as_proxy().certificate_store.clone(),
     )?);
     let server_config = Arc::new(
         ServerConfig::builder()
@@ -87,7 +91,7 @@ fn run(options: &Options) -> Result<()> {
     let mut poll = Poll::new()?;
     listener.register(poll.registry(), Token(0), Interest::READABLE)?;
     let mut resolver = DnsResolver::new(
-        options.as_run().dns_server.clone(),
+        options.as_proxy().dns_server.clone(),
         Token(1),
         poll.registry(),
     )?;
@@ -125,9 +129,9 @@ fn run(options: &Options) -> Result<()> {
     Ok(())
 }
 
-fn hyper(options: Options) -> Result<()> {
-    let mut listener = TcpListener::bind("0.0.0.0:443".parse()?)?;
+fn run(options: Options) -> Result<()> {
+    let listener = TcpListener::bind("0.0.0.0:443".parse()?)?;
     let runtime = Runtime::new()?;
-    let _ = runtime.block_on(build(listener, options))?;
+    let _ = runtime.block_on(acceptor::run(listener, options))?;
     Ok(())
 }

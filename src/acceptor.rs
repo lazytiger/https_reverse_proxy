@@ -1,10 +1,8 @@
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Read, Write};
-use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -13,19 +11,16 @@ use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{http, Body, Client, Request, Response, Uri};
 use hyper_rustls::HttpsConnector;
-use lazy_static::lazy_static;
 use mio::event::Source;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Poll as MPoll, Token};
-use rustls::{ServerConfig, ServerConnection};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use rustls::ServerConfig;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::cert_resolver::DynamicCertificateResolver;
 use crate::options::Options;
-use crate::tls_conn::TlsConnection;
 use crate::tls_conn::TlsStream;
 use crate::types;
-use crate::types::is_would_block;
 
 #[derive(Clone)]
 pub struct TlsPoll {
@@ -128,12 +123,14 @@ impl TlsPoll {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn deregister(&self, source: &mut impl Source) -> types::Result<()> {
         let lock = self.poll.read().map_err(|_| types::Error::ReadLock)?;
         source.deregister(lock.registry())?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn reregister(
         &self,
         source: &mut impl Source,
@@ -231,6 +228,13 @@ impl HttpsConnection {
     }
 }
 
+impl Drop for HttpsConnection {
+    fn drop(&mut self) {
+        let _ = self.poll.deregister(&mut self.stream);
+        log::info!("connection:{} dropped", self.token.0);
+    }
+}
+
 impl AsyncRead for HttpsConnection {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -240,7 +244,7 @@ impl AsyncRead for HttpsConnection {
         let pin = self.get_mut();
         let _ = pin.poll.set_read_waker(pin.token, cx.waker().clone());
         let mut offset = buf.filled().len();
-        let mut buffer = buf.initialize_unfilled();
+        let buffer = buf.initialize_unfilled();
         match pin.stream.read(buffer) {
             Ok(n) => {
                 offset += n;
@@ -285,7 +289,7 @@ impl AsyncWrite for HttpsConnection {
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let pin = self.get_mut();
         let _ = pin.stream.shutdown();
         Poll::Ready(Ok(()))
@@ -314,20 +318,26 @@ async fn do_request(mut req: Request<Body>) -> types::Result<Response<Body>> {
         .path_and_query()
         .ok_or(types::Error::NoPathAndQuery)?
         .as_str();
-    let url = format!("https://{}/{}", host, query);
-    log::info!("url:{}", url);
+    let url = format!("https://{}{}", host, query);
     *req.uri_mut() = Uri::from_str(url.as_str())?;
-    let resp = CLIENT.request(req).await;
-    if let Ok(resp) = &resp {
-        log::info!(
-            "content-type:{:?}",
-            resp.headers().get(http::header::CONTENT_TYPE)
-        );
+    let mut resp = CLIENT.request(req).await?;
+    if let Err(err) = do_response(&mut resp).await {
+        log::error!("do_response for url:{} failed:{}", url, err);
     }
-    Ok(resp?)
+    Ok(resp)
 }
 
-pub async fn build(listener: TcpListener, options: Options) -> types::Result<()> {
+async fn do_response(resp: &mut Response<Body>) -> types::Result<()> {
+    let content_type = resp
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .ok_or(types::Error::NoContentType)?
+        .to_str()?;
+    log::info!("content_type:{}", content_type);
+    Ok(())
+}
+
+pub async fn run(listener: TcpListener, options: Options) -> types::Result<()> {
     let resolver = Arc::new(DynamicCertificateResolver::new(
         options.ca_crt_path.clone(),
         options.ca_key_path.clone(),
@@ -342,7 +352,7 @@ pub async fn build(listener: TcpListener, options: Options) -> types::Result<()>
     let poll = TlsPoll::new().unwrap();
 
     let builder = hyper::server::Server::builder(TlsAcceptor::new(listener, config, poll.clone())?);
-    let make_server = make_service_fn(|conn: &HttpsConnection| async move {
+    let make_server = make_service_fn(|_conn: &HttpsConnection| async {
         Ok::<_, types::Error>(service_fn(do_request))
     });
 
@@ -374,6 +384,13 @@ pub struct FileStream {
     file: tokio::fs::File,
 }
 
+impl FileStream {
+    pub async fn new(name: &str) -> types::Result<FileStream> {
+        let file = tokio::fs::File::open(name).await?;
+        Ok(Self { file })
+    }
+}
+
 impl futures_core::Stream for FileStream {
     type Item = types::Result<Vec<u8>>;
 
@@ -392,8 +409,4 @@ impl futures_core::Stream for FileStream {
             Poll::Pending => Poll::Pending,
         }
     }
-}
-
-fn test(f: FileStream) {
-    let body = Body::wrap_stream(f);
 }

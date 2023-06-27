@@ -29,6 +29,8 @@ pub enum Command {
     Run(RunArgs),
     #[clap(version, name = "gen", about = "generate a root ca")]
     Generate(GenerateArgs),
+    #[clap(version, name = "proxy", about = "run in proxy mode")]
+    Proxy(RunArgs),
 }
 
 #[derive(Parser)]
@@ -61,6 +63,13 @@ impl Options {
     pub fn as_generate(&self) -> &GenerateArgs {
         match &self.command {
             Command::Generate(args) => args,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn as_proxy(&self) -> &RunArgs {
+        match &self.command {
+            Command::Proxy(args) => args,
             _ => unreachable!(),
         }
     }
