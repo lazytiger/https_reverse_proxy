@@ -54,6 +54,10 @@ pub struct RunArgs {
     /// a list of content-type which will be cached
     #[arg(short = 't', long)]
     pub content_types: Vec<String>,
+
+    /// buffer size in KB for file transfer
+    #[arg(short, long, default_value = "16")]
+    pub file_buffer: usize,
 }
 
 #[derive(Parser)]

@@ -99,7 +99,7 @@ fn proxy() -> Result<()> {
             .with_root_certificates(root_store)
             .with_no_client_auth(),
     );
-    let mut listener = TcpListener::bind("0.0.0.0:443".parse()?)?;
+    let mut listener = TcpListener::bind(options().as_proxy().listen_address.parse()?)?;
     let mut poll = Poll::new()?;
     listener.register(poll.registry(), Token(0), Interest::READABLE)?;
     let mut resolver = DnsResolver::new(
@@ -142,8 +142,7 @@ fn proxy() -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:443".parse()?)?;
     let runtime = Runtime::new()?;
-    let _ = runtime.block_on(acceptor::run(listener))?;
+    let _ = runtime.block_on(acceptor::run())?;
     Ok(())
 }
