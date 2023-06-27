@@ -12,7 +12,7 @@ use hyper::client::HttpConnector;
 use hyper::http::HeaderName;
 use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{http, Body, Client, HeaderMap, Request, Response, Uri};
+use hyper::{http, Body, Client, HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_rustls::HttpsConnector;
 use mio::event::Source;
 use mio::net::{TcpListener, TcpStream};
@@ -326,8 +326,11 @@ async fn do_request(mut req: Request<Body>) -> types::Result<Response<Body>> {
     *req.uri_mut() = Uri::from_str(url.as_str())?;
     let mut resp = CLIENT.request(req).await?;
     let content_length = get_header_value(resp.headers(), http::header::CONTENT_LENGTH, 0usize);
-    if let Err(err) = do_response(range, content_length, url.clone(), &mut resp).await {
-        log::error!("do_response for url:{} failed:{}", url, err);
+    log::info!("status:{}", resp.status());
+    if resp.status().is_success() {
+        if let Err(err) = do_response(range, content_length, url.clone(), &mut resp).await {
+            log::error!("do_response for url:{} failed:{}", url, err);
+        }
     }
     Ok(resp)
 }
@@ -387,6 +390,7 @@ async fn do_response(
                 if !ok {
                     drop(file);
                     std::fs::remove_file(&tmp_file)?;
+                    *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
                     return Ok(());
                 }
             }
@@ -394,6 +398,7 @@ async fn do_response(
                 log::info!("content-length is not match:{}-{}", length, content_length);
                 drop(file);
                 std::fs::remove_file(&tmp_file)?;
+                *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
                 return Ok(());
             }
             file.flush().await?;
