@@ -19,6 +19,7 @@ use mio::event::Source;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Poll as MPoll, Token};
 use rustls::ServerConfig;
+use scan_fmt::scan_fmt;
 use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, ReadBuf};
 
 use crate::cert_resolver::DynamicCertificateResolver;
@@ -323,14 +324,20 @@ async fn do_request(mut req: Request<Body>) -> types::Result<Response<Body>> {
         .as_str();
     let url = format!("https://{}{}", host, query);
     let range = get_header_value(req.headers(), http::header::RANGE, "".to_string());
-    log::info!("range:{}", range);
-    let range = get_header_value(req.headers(), http::header::RANGE, 0usize);
+    let (range_start, range_end) = if let Ok((range_start, range_end)) =
+        scan_fmt!(range.as_str(), "bytes={}-{}", usize, usize)
+    {
+        (range_start, range_end)
+    } else {
+        log::info!("parse range:'{}' failed", range);
+        (0, 0)
+    };
     *req.uri_mut() = Uri::from_str(url.as_str())?;
     let mut resp = CLIENT.request(req).await?;
     let content_length = get_header_value(resp.headers(), http::header::CONTENT_LENGTH, 0usize);
     log::info!("status:{}", resp.status());
     if resp.status().is_success() {
-        resp = match do_response(range, content_length, url.clone(), resp).await {
+        resp = match do_cache(range_start, range_end, content_length, url.clone(), resp).await {
             Ok(ret) => ret,
             Err(err) => {
                 log::error!("found error:{}", err);
@@ -357,18 +364,20 @@ where
         .unwrap_or(dft)
 }
 
-async fn do_response(
-    range: usize,
+async fn do_cache(
+    range_start: usize,
+    range_end: usize,
     content_length: usize,
     url: String,
     mut resp: Response<Body>,
 ) -> types::Result<Response<Body>> {
     let content_type = get_header_value(resp.headers(), http::header::CONTENT_TYPE, "".to_string());
     log::info!(
-        "content-type:{}, content-length:{}, range:{}",
+        "content-type:{}, content-length:{}, range:{}-{}",
         content_type,
         content_length,
-        range
+        range_start,
+        range_end,
     );
     if options().as_run().content_types.contains(&content_type) {
         let (path, name) = utils::get_path_and_name(url.as_str(), 3);
@@ -376,22 +385,27 @@ async fn do_response(
         let dir = root.join(path);
         std::fs::create_dir_all(&dir)?;
         let name = dir.join(name);
-        if !name.is_file() && range == 0 && content_length > 0 {
+        if !name.is_file() && range_start == 0 && content_length > 0 {
             let tmp_file = name.to_string_lossy().to_string() + ".tmp";
-            let file = OpenOptions::new()
+            if let Ok(file) = OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .append(true)
-                .open(&tmp_file)?;
-            log::info!("cache not found, save response now");
-
-            let (parts, body) = resp.into_parts();
-            let saver = BodySaverStream::new(file, body, tmp_file, name.clone(), content_length);
-            resp = Response::from_parts(parts, Body::wrap_stream(saver));
+                .open(&tmp_file)
+            {
+                log::info!("cache not found, save response now");
+                let (parts, body) = resp.into_parts();
+                let saver =
+                    BodySaverStream::new(file, body, tmp_file, name.clone(), content_length);
+                resp = Response::from_parts(parts, Body::wrap_stream(saver));
+            } else {
+                log::info!("cache already going");
+                return Ok(resp);
+            }
         }
         if name.is_file() {
             log::info!("cache found");
-            let file = FileStream::new(&name, range).await?;
+            let file = FileStream::new(&name, range_start, range_end).await?;
             *resp.body_mut() = Body::wrap_stream(file);
         }
     } else {
@@ -446,13 +460,26 @@ pub async fn run() -> types::Result<()> {
 
 pub struct FileStream {
     file: tokio::fs::File,
+    offset: usize,
+    range_end: usize,
 }
 
 impl FileStream {
-    pub async fn new(name: impl AsRef<Path>, range: usize) -> types::Result<FileStream> {
+    pub async fn new(
+        name: impl AsRef<Path>,
+        range_start: usize,
+        mut range_end: usize,
+    ) -> types::Result<FileStream> {
+        if range_end == 0 {
+            range_end = std::fs::metadata(&name)?.len() as usize;
+        }
         let mut file = tokio::fs::File::open(name).await?;
-        file.seek(SeekFrom::Start(range as u64)).await?;
-        Ok(Self { file })
+        file.seek(SeekFrom::Start(range_start as u64)).await?;
+        Ok(Self {
+            file,
+            offset: range_start,
+            range_end,
+        })
     }
 }
 
@@ -461,11 +488,16 @@ impl futures_core::Stream for FileStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut data = vec![0u8; options().as_run().file_buffer * 1024];
-        let mut buf = ReadBuf::new(data.as_mut_slice());
+        let len = data.len().min(self.range_end - self.offset);
+        let mut buf = ReadBuf::new(&mut data.as_mut_slice()[..len]);
+        if self.range_end == self.offset {
+            return Poll::Ready(None);
+        }
         match Pin::new(&mut self.file).poll_read(cx, &mut buf) {
             Poll::Ready(Ok(_)) => {
                 unsafe {
                     let len = buf.filled().len();
+                    self.offset += len;
                     data.set_len(len);
                 }
                 Poll::Ready(Some(Ok(data)))
@@ -483,6 +515,7 @@ pub struct BodySaverStream {
     name: PathBuf,
     content_length: usize,
     length: usize,
+    completed: bool,
 }
 
 impl BodySaverStream {
@@ -500,9 +533,13 @@ impl BodySaverStream {
             name,
             content_length,
             length: 0,
+            completed: false,
         }
     }
     fn done(&self, mut ok: bool) {
+        if self.completed {
+            return;
+        }
         if self.content_length != self.length {
             if ok {
                 log::error!(
@@ -513,6 +550,8 @@ impl BodySaverStream {
                 ok = false;
             }
         }
+        log::info!("body saver finished:{}", ok);
+
         let ret = if ok {
             std::fs::rename(&self.tmp_file, &self.name)
         } else {
@@ -536,6 +575,10 @@ impl futures_core::Stream for BodySaverStream {
                     Poll::Ready(Some(Err(err.into())))
                 } else {
                     self.length += item.len();
+                    if self.length == self.content_length {
+                        log::info!("done now");
+                        self.done(true);
+                    }
                     Poll::Ready(Some(Ok(item)))
                 }
             }
