@@ -22,7 +22,7 @@ trust-dns-proto = "0.22"
 webpki-roots = "0.23"
 md5 = "0.7"
 hyper = { version = "0.14", features = ["full"] }
-tokio = { version = "1.27", features = ["fs"] }
+tokio = { version = "1.27", features = ["fs", "net"] }
 hyper-rustls = "0.24"
 futures-core = "0.3"
 lazy_static = "1.4"

@@ -19,8 +19,6 @@ pub enum Error {
     RustClientInvalidDnsName(rustls::client::InvalidDnsNameError),
     //Eof,
     DnsQuery,
-    ReadLock,
-    WriteLock,
     Handshake,
     NoHostName,
     ReaderClosed,

@@ -1,12 +1,10 @@
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Read, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
-use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use hyper::body::Bytes;
 use hyper::client::HttpConnector;
@@ -15,158 +13,22 @@ use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{http, Body, Client, HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_rustls::HttpsConnector;
-use mio::event::Source;
-use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Poll as MPoll, Token};
-use rustls::ServerConfig;
+use rustls::{ServerConfig, ServerConnection};
 use scan_fmt::scan_fmt;
 use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::cert_resolver::DynamicCertificateResolver;
-use crate::tls_conn::TlsStream;
 use crate::{options, types, utils};
-
-#[derive(Clone)]
-pub struct TlsPoll {
-    poll: Arc<RwLock<MPoll>>,
-    read_wakers: Arc<RwLock<HashMap<Token, Waker>>>,
-    write_wakers: Arc<RwLock<HashMap<Token, Waker>>>,
-    flush_wakers: Arc<RwLock<HashMap<Token, Waker>>>,
-}
-
-impl TlsPoll {
-    pub fn new() -> types::Result<Self> {
-        Ok(TlsPoll {
-            poll: Arc::new(RwLock::new(MPoll::new()?)),
-            read_wakers: Default::default(),
-            write_wakers: Default::default(),
-            flush_wakers: Default::default(),
-        })
-    }
-
-    pub fn wake_read(&self, token: Token) -> types::Result<()> {
-        let lock = self
-            .read_wakers
-            .read()
-            .map_err(|_| types::Error::ReadLock)?;
-        if let Some(waker) = lock.get(&token) {
-            waker.wake_by_ref();
-        } else {
-            log::info!("read waker for connection:{} not found", token.0);
-        }
-        Ok(())
-    }
-
-    pub fn wake_write(&self, token: Token) -> types::Result<()> {
-        let lock = self
-            .write_wakers
-            .read()
-            .map_err(|_| types::Error::ReadLock)?;
-        if let Some(waker) = lock.get(&token) {
-            waker.wake_by_ref();
-        } else {
-            //log::warn!("write waker for connection:{} not found", token.0);
-        }
-        Ok(())
-    }
-
-    pub fn wake_flush(&self, token: Token) -> types::Result<()> {
-        let lock = self
-            .flush_wakers
-            .read()
-            .map_err(|_| types::Error::ReadLock)?;
-        if let Some(waker) = lock.get(&token) {
-            waker.wake_by_ref();
-        } else {
-            log::warn!("flush waker for connection:{} not found", token.0);
-        }
-        Ok(())
-    }
-
-    pub fn set_read_waker(&self, token: Token, waker: Waker) -> types::Result<()> {
-        let mut lock = self
-            .read_wakers
-            .write()
-            .map_err(|_| types::Error::WriteLock)?;
-        lock.insert(token, waker);
-        Ok(())
-    }
-
-    pub fn set_write_waker(&self, token: Token, waker: Waker) -> types::Result<()> {
-        let mut lock = self
-            .write_wakers
-            .write()
-            .map_err(|_| types::Error::WriteLock)?;
-        lock.insert(token, waker);
-        Ok(())
-    }
-
-    pub fn set_flush_waker(&self, token: Token, waker: Waker) -> types::Result<()> {
-        let mut lock = self
-            .flush_wakers
-            .write()
-            .map_err(|_| types::Error::WriteLock)?;
-        lock.insert(token, waker);
-        Ok(())
-    }
-
-    pub fn poll(&self, events: &mut Events, timeout: Option<Duration>) -> types::Result<()> {
-        let mut lock = self.poll.write().map_err(|_| types::Error::WriteLock)?;
-        lock.poll(events, timeout)?;
-        Ok(())
-    }
-
-    pub fn register(
-        &self,
-        source: &mut impl Source,
-        token: Token,
-        interests: mio::Interest,
-    ) -> types::Result<()> {
-        let lock = self.poll.read().map_err(|_| types::Error::ReadLock)?;
-        source.register(lock.registry(), token, interests)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn deregister(&self, source: &mut impl Source) -> types::Result<()> {
-        let lock = self.poll.read().map_err(|_| types::Error::ReadLock)?;
-        source.deregister(lock.registry())?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn reregister(
-        &self,
-        source: &mut impl Source,
-        token: Token,
-        interests: mio::Interest,
-    ) -> types::Result<()> {
-        let lock = self.poll.read().map_err(|_| types::Error::ReadLock)?;
-        source.reregister(lock.registry(), token, interests)?;
-        Ok(())
-    }
-}
 
 pub struct TlsAcceptor {
     listener: TcpListener,
     config: Arc<ServerConfig>,
-    poll: TlsPoll,
-    next_token: usize,
 }
 
 impl TlsAcceptor {
-    pub fn new(
-        mut listener: TcpListener,
-        config: Arc<ServerConfig>,
-        poll: TlsPoll,
-    ) -> types::Result<Self> {
-        poll.register(&mut listener, Token(0), mio::Interest::READABLE)?;
-        Ok(Self {
-            listener,
-            config,
-            poll,
-            next_token: 1,
-        })
+    pub fn new(listener: TcpListener, config: Arc<ServerConfig>) -> types::Result<Self> {
+        Ok(Self { listener, config })
     }
 }
 
@@ -176,16 +38,13 @@ impl Accept for TlsAcceptor {
 
     fn poll_accept(
         self: Pin<&mut Self>,
-        ctx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
         let pin = self.get_mut();
-        let _ = pin.poll.set_read_waker(Token(0), ctx.waker().clone());
-        match pin.listener.accept() {
-            Ok((stream, addr)) => {
+        match Pin::new(&mut pin.listener).poll_accept(cx) {
+            Poll::Ready(Ok((stream, addr))) => {
                 log::info!("new connection from:{}", addr);
-                let token = Token(pin.next_token);
-                pin.next_token += 1;
-                match HttpsConnection::new(pin.poll.clone(), token, stream, pin.config.clone()) {
+                match HttpsConnection::new(stream, pin.config.clone()) {
                     Ok(conn) => {
                         log::info!("new connection created");
                         Poll::Ready(Some(Ok(conn)))
@@ -196,46 +55,28 @@ impl Accept for TlsAcceptor {
                     }
                 }
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                log::info!("accept blocked");
-                Poll::Pending
-            }
-            Err(err) => Poll::Ready(Some(Err(err.into()))),
+            Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err.into()))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 pub struct HttpsConnection {
-    stream: TlsStream,
-    poll: TlsPoll,
-    token: Token,
+    stream: TcpStream,
+    session: ServerConnection,
+    recv_buf: Vec<u8>,
+    send_buf: Vec<u8>,
 }
 
 impl HttpsConnection {
-    fn new(
-        poll: TlsPoll,
-        token: Token,
-        mut stream: TcpStream,
-        config: Arc<ServerConfig>,
-    ) -> types::Result<Self> {
-        poll.register(
-            &mut stream,
-            token,
-            mio::Interest::READABLE | mio::Interest::WRITABLE,
-        )?;
-        let stream = TlsStream::new_server(stream, config, None)?;
+    fn new(stream: TcpStream, config: Arc<ServerConfig>) -> types::Result<Self> {
+        let session = ServerConnection::new(config)?;
         Ok(Self {
-            token,
-            poll,
             stream,
+            session,
+            recv_buf: vec![0u8; options().as_run().net_buffer_size],
+            send_buf: Vec::new(),
         })
-    }
-}
-
-impl Drop for HttpsConnection {
-    fn drop(&mut self) {
-        let _ = self.poll.deregister(&mut self.stream);
-        log::info!("connection:{} dropped", self.token.0);
     }
 }
 
@@ -246,18 +87,25 @@ impl AsyncRead for HttpsConnection {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let pin = self.get_mut();
-        let _ = pin.poll.set_read_waker(pin.token, cx.waker().clone());
-        let mut offset = buf.filled().len();
-        let buffer = buf.initialize_unfilled();
-        match pin.stream.read(buffer) {
-            Ok(n) => {
-                offset += n;
-                buf.set_filled(offset);
-                //cx.waker().wake_by_ref();
-                Poll::Ready(Ok(()))
+        if let Err(err) = pin.session.reader().read(buf.initialize_unfilled()) {
+            if err.kind() != ErrorKind::WouldBlock {
+                return Poll::Ready(Err(err));
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
-            Err(err) => Poll::Ready(Err(err.into())),
+        } else {
+            return Poll::Ready(Ok(()));
+        }
+        let mut raw_buf = ReadBuf::new(pin.recv_buf.as_mut_slice());
+        match Pin::new(&mut pin.stream).poll_read(cx, &mut raw_buf) {
+            Poll::Ready(Ok(_)) => {
+                if let Err(err) = pin.session.read_tls(&mut raw_buf.filled()) {
+                    Poll::Ready(Err(err))
+                } else if let Err(_) = pin.session.process_new_packets() {
+                    Poll::Ready(Err(ErrorKind::InvalidData.into()))
+                } else {
+                    Pin::new(pin).poll_read(cx, buf)
+                }
+            }
+            ret => ret,
         }
     }
 }
@@ -269,34 +117,53 @@ impl AsyncWrite for HttpsConnection {
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
         let pin = self.get_mut();
-        let _ = pin.poll.set_write_waker(pin.token, cx.waker().clone());
-        match pin.stream.write(buf) {
-            Ok(n) => {
-                //cx.waker().wake_by_ref();
-                Poll::Ready(Ok(n))
+        if pin.send_buf.is_empty() {
+            // session is empty, write buf to session first
+            match pin.session.writer().write(buf) {
+                // read actual data from session, drain the session.
+                Ok(n) => match pin.session.write_tls(&mut pin.send_buf) {
+                    // trying to flush data
+                    Ok(_) => match Pin::new(pin).poll_flush(cx) {
+                        Poll::Ready(Ok(_)) => Poll::Ready(Ok(n)),
+                        Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                        Poll::Pending => Poll::Pending,
+                    },
+                    Err(err) => Poll::Ready(Err(err)),
+                },
+                Err(err) => Poll::Ready(Err(err)),
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
-            Err(err) => Poll::Ready(Err(err.into())),
+        } else {
+            // session is not empty, flush data first and always return pending, except error
+            match Pin::new(pin).poll_flush(cx).map(|t| t.map(|_| 0usize)) {
+                Poll::Ready(Ok(_)) => Poll::Pending,
+                ret => ret,
+            }
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let pin = self.get_mut();
-        let _ = pin.poll.set_flush_waker(pin.token, cx.waker().clone());
-        match pin.stream.flush() {
-            Ok(_) => {
-                //cx.waker().wake_by_ref();
-                Poll::Ready(Ok(()))
+        if pin.send_buf.is_empty() {
+            Poll::Ready(Ok(()))
+        } else {
+            match Pin::new(&mut pin.stream).poll_write(cx, pin.send_buf.as_slice()) {
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(ErrorKind::UnexpectedEof.into())),
+                Poll::Ready(Ok(n)) => {
+                    pin.send_buf.copy_within(n.., 0);
+                    unsafe {
+                        pin.send_buf.set_len(pin.send_buf.len() - n);
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Pending => Poll::Pending,
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
-            Err(err) => Poll::Ready(Err(err.into())),
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let pin = self.get_mut();
-        let _ = pin.stream.shutdown();
-        Poll::Ready(Ok(()))
+        Pin::new(&mut pin.stream).poll_shutdown(cx)
     }
 }
 
@@ -426,32 +293,14 @@ pub async fn run() -> types::Result<()> {
             .with_no_client_auth()
             .with_cert_resolver(resolver),
     );
-    let poll = TlsPoll::new().unwrap();
 
-    let listener = TcpListener::bind(options().as_run().listen_address.parse()?)?;
-    let builder = hyper::server::Server::builder(TlsAcceptor::new(listener, config, poll.clone())?);
+    let listener = TcpListener::bind(options().as_run().listen_address.as_str()).await?;
+    let builder = hyper::server::Server::builder(TlsAcceptor::new(listener, config)?);
     let make_server = make_service_fn(|_conn: &HttpsConnection| async {
         Ok::<_, types::Error>(service_fn(do_request))
     });
 
     let server = builder.http1_keepalive(true).serve(make_server);
-
-    std::thread::spawn(move || {
-        log::info!("mio thread started");
-        let mut events = Events::with_capacity(1024);
-        while let Ok(()) = poll.poll(&mut events, Some(Duration::from_millis(1))) {
-            for event in events.iter() {
-                if event.is_readable() {
-                    let _ = poll.wake_read(event.token());
-                }
-                if event.is_writable() {
-                    let _ = poll.wake_write(event.token());
-                    let _ = poll.wake_flush(event.token());
-                }
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
     if let Err(err) = server.await {
         log::error!("server exit:{}", err);
     }
@@ -487,7 +336,7 @@ impl futures_core::Stream for FileStream {
     type Item = types::Result<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut data = vec![0u8; options().as_run().file_buffer * 1024];
+        let mut data = vec![0u8; options().as_run().file_buffer_size * 1024];
         let len = data.len().min(self.range_end - self.offset);
         let mut buf = ReadBuf::new(&mut data.as_mut_slice()[..len]);
         if self.range_end == self.offset {

@@ -1,5 +1,4 @@
 use std::io::{Error, ErrorKind, Read, Write};
-use std::net::Shutdown;
 use std::sync::Arc;
 
 use mio::event::Source;
@@ -72,17 +71,6 @@ impl TlsSession {
             TlsSession::Client(conn) => conn.wants_write(),
         }
     }
-
-    pub fn send_close_notify(&mut self) {
-        match self {
-            TlsSession::Server(conn) => {
-                conn.send_close_notify();
-            }
-            TlsSession::Client(conn) => {
-                conn.send_close_notify();
-            }
-        }
-    }
 }
 
 pub struct TlsStream {
@@ -119,11 +107,6 @@ impl TlsStream {
             session: TlsSession::Client(session),
             buffer_limit,
         })
-    }
-
-    pub fn shutdown(&mut self) -> std::io::Result<()> {
-        self.session.send_close_notify();
-        self.stream.shutdown(Shutdown::Both)
     }
 }
 

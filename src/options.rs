@@ -57,7 +57,11 @@ pub struct RunArgs {
 
     /// buffer size in KB for file transfer
     #[arg(short, long, default_value = "16")]
-    pub file_buffer: usize,
+    pub file_buffer_size: usize,
+
+    /// buffer size in KB for network transfer
+    #[arg(short, long, default_value = "4")]
+    pub net_buffer_size: usize,
 }
 
 #[derive(Parser)]
