@@ -1,9 +1,10 @@
 use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Read, SeekFrom, Write};
+use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use hyper::body::Bytes;
@@ -33,7 +34,7 @@ impl TlsAcceptor {
 }
 
 impl Accept for TlsAcceptor {
-    type Conn = HttpsConnection;
+    type Conn = TlsStream;
     type Error = types::Error;
 
     fn poll_accept(
@@ -44,7 +45,7 @@ impl Accept for TlsAcceptor {
         match Pin::new(&mut pin.listener).poll_accept(cx) {
             Poll::Ready(Ok((stream, addr))) => {
                 log::info!("new connection from:{}", addr);
-                match HttpsConnection::new(stream, pin.config.clone()) {
+                match TlsStream::new(stream, pin.config.clone()) {
                     Ok(conn) => {
                         log::info!("new connection created");
                         Poll::Ready(Some(Ok(conn)))
@@ -61,14 +62,66 @@ impl Accept for TlsAcceptor {
     }
 }
 
-pub struct HttpsConnection {
+pub struct TlsReadHalf {
+    stream: Arc<Mutex<TlsStream>>,
+}
+
+impl AsyncRead for TlsReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let pin = self.get_mut();
+        pin.stream
+            .lock()
+            .map(|mut lock| Pin::new(lock.deref_mut()).poll_read(cx, buf))
+            .unwrap_or(Poll::Ready(Err(ErrorKind::Other.into())))
+    }
+}
+
+pub struct TlsWriteHalf {
+    stream: Arc<Mutex<TlsStream>>,
+}
+
+impl AsyncWrite for TlsWriteHalf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        let pin = self.get_mut();
+        pin.stream
+            .lock()
+            .map(|mut lock| Pin::new(lock.deref_mut()).poll_write(cx, buf))
+            .unwrap_or(Poll::Ready(Err(ErrorKind::Other.into())))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        let pin = self.get_mut();
+        pin.stream
+            .lock()
+            .map(|mut lock| Pin::new(lock.deref_mut()).poll_flush(cx))
+            .unwrap_or(Poll::Ready(Err(ErrorKind::Other.into())))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        let pin = self.get_mut();
+        pin.stream
+            .lock()
+            .map(|mut lock| Pin::new(lock.deref_mut()).poll_shutdown(cx))
+            .unwrap_or(Poll::Ready(Err(ErrorKind::Other.into())))
+    }
+}
+
+pub struct TlsStream {
     stream: TcpStream,
     session: ServerConnection,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
 }
 
-impl HttpsConnection {
+impl TlsStream {
     fn new(stream: TcpStream, config: Arc<ServerConfig>) -> types::Result<Self> {
         let session = ServerConnection::new(config)?;
         Ok(Self {
@@ -79,7 +132,17 @@ impl HttpsConnection {
         })
     }
 
-    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, Error>> {
+    pub fn into_split(self) -> (TlsReadHalf, TlsWriteHalf) {
+        let stream = Arc::new(Mutex::new(self));
+        (
+            TlsReadHalf {
+                stream: stream.clone(),
+            },
+            TlsWriteHalf { stream },
+        )
+    }
+
+    fn poll_tls_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, Error>> {
         if self.session.wants_write() {
             if let Err(err) = self.session.write_tls(&mut self.send_buf) {
                 return Poll::Ready(Err(err));
@@ -102,18 +165,16 @@ impl HttpsConnection {
     }
 }
 
-impl AsyncRead for HttpsConnection {
+impl AsyncRead for TlsStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        log::info!("async_read poll_read");
         let pin = self.get_mut();
         match pin.session.reader().read(buf.initialize_unfilled()) {
             Err(err) => {
                 if err.kind() != ErrorKind::WouldBlock {
-                    log::info!("read session failed:{}", err);
                     return Poll::Ready(Err(err));
                 }
             }
@@ -125,7 +186,6 @@ impl AsyncRead for HttpsConnection {
         let mut raw_buf = ReadBuf::new(pin.recv_buf.as_mut_slice());
         match Pin::new(&mut pin.stream).poll_read(cx, &mut raw_buf) {
             Poll::Ready(Ok(_)) => {
-                log::info!("read {} bytes from stream", raw_buf.filled().len());
                 if raw_buf.filled().is_empty() {
                     Poll::Ready(Ok(()))
                 } else if let Err(err) = pin.session.read_tls(&mut raw_buf.filled()) {
@@ -135,8 +195,7 @@ impl AsyncRead for HttpsConnection {
                 } else {
                     // when handshaking, auto send data
                     if pin.session.is_handshaking() {
-                        if let Poll::Ready(Err(err)) = pin.poll_flush(cx) {
-                            log::info!("poll_flush failed:{}", err);
+                        if let Poll::Ready(Err(err)) = pin.poll_tls_write(cx) {
                             return Poll::Ready(Err(err));
                         }
                     }
@@ -148,17 +207,16 @@ impl AsyncRead for HttpsConnection {
     }
 }
 
-impl AsyncWrite for HttpsConnection {
+impl AsyncWrite for TlsStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
-        log::info!("async_write poll_write");
         let pin = self.get_mut();
         match pin.session.writer().write(buf) {
             // read actual data from session, drain the session.
-            Ok(n) => match pin.poll_flush(cx) {
+            Ok(n) => match pin.poll_tls_write(cx) {
                 // trying to flush data
                 Poll::Ready(Ok(_)) => Poll::Ready(Ok(n)),
                 ret => ret,
@@ -168,9 +226,8 @@ impl AsyncWrite for HttpsConnection {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        log::info!("async_write poll_flush");
         let pin = self.get_mut();
-        pin.poll_flush(cx).map(|r| r.map(|_| ()))
+        pin.poll_tls_write(cx).map(|r| r.map(|_| ()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
@@ -308,7 +365,7 @@ pub async fn run() -> types::Result<()> {
 
     let listener = TcpListener::bind(options().as_run().listen_address.as_str()).await?;
     let builder = hyper::server::Server::builder(TlsAcceptor::new(listener, config)?);
-    let make_server = make_service_fn(|_conn: &HttpsConnection| async {
+    let make_server = make_service_fn(|_conn: &TlsStream| async {
         Ok::<_, types::Error>(service_fn(do_request))
     });
 
