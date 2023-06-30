@@ -1,11 +1,13 @@
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::{Error, ErrorKind, Read, SeekFrom, Write};
+use std::marker::PhantomData;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
+use std::pin::{pin, Pin};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 
 use hyper::body::Bytes;
 use hyper::client::HttpConnector;
@@ -14,10 +16,13 @@ use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{http, Body, Client, HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_rustls::HttpsConnector;
-use rustls::{ServerConfig, ServerConnection};
+use rustls::client::ClientConnectionData;
+use rustls::server::ServerConnectionData;
+use rustls::{ClientConnection, ConnectionCommon, ServerConfig, ServerConnection};
 use scan_fmt::scan_fmt;
 use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
 use crate::cert_resolver::DynamicCertificateResolver;
 use crate::{options, types, utils};
@@ -34,7 +39,7 @@ impl TlsAcceptor {
 }
 
 impl Accept for TlsAcceptor {
-    type Conn = TlsStream;
+    type Conn = TlsServerStream;
     type Error = types::Error;
 
     fn poll_accept(
@@ -45,7 +50,10 @@ impl Accept for TlsAcceptor {
         match Pin::new(&mut pin.listener).poll_accept(cx) {
             Poll::Ready(Ok((stream, addr))) => {
                 log::info!("new connection from:{}", addr);
-                match TlsStream::new(stream, pin.config.clone()) {
+                match TlsServerStream::new(
+                    stream,
+                    ServerConnection::new(pin.config.clone()).unwrap(),
+                ) {
                     Ok(conn) => {
                         log::info!("new connection created");
                         Poll::Ready(Some(Ok(conn)))
@@ -62,77 +70,91 @@ impl Accept for TlsAcceptor {
     }
 }
 
-pub struct TlsReadHalf {
-    stream: Arc<Mutex<TlsStream>>,
+pub type TlsServerStream = TlsStream<ServerConnection, ServerConnectionData>;
+pub type TlsClientStream = TlsStream<ClientConnection, ClientConnectionData>;
+
+pub struct TlsReadHalf<T, D> {
+    stream: Arc<Mutex<TlsStream<T, D>>>,
 }
 
-impl AsyncRead for TlsReadHalf {
+impl<T, D> AsyncRead for TlsReadHalf<T, D>
+where
+    T: DerefMut<Target = ConnectionCommon<D>>,
+    T: Unpin,
+    D: Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let pin = self.get_mut();
-        pin.stream
-            .lock()
-            .map(|mut lock| Pin::new(lock.deref_mut()).poll_read(cx, buf))
-            .unwrap_or(Poll::Ready(Err(ErrorKind::Other.into())))
+        let mut lock = pin.stream.lock();
+        let mut lock = ready!(pin!(lock).poll(cx));
+        Pin::new(lock.deref_mut()).poll_read(cx, buf)
     }
 }
 
-pub struct TlsWriteHalf {
-    stream: Arc<Mutex<TlsStream>>,
+pub struct TlsWriteHalf<T, D> {
+    stream: Arc<Mutex<TlsStream<T, D>>>,
 }
 
-impl AsyncWrite for TlsWriteHalf {
+impl<T, D> AsyncWrite for TlsWriteHalf<T, D>
+where
+    T: DerefMut<Target = ConnectionCommon<D>>,
+    T: Unpin,
+    D: Unpin,
+{
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
         let pin = self.get_mut();
-        pin.stream
-            .lock()
-            .map(|mut lock| Pin::new(lock.deref_mut()).poll_write(cx, buf))
-            .unwrap_or(Poll::Ready(Err(ErrorKind::Other.into())))
+        let mut lock = pin.stream.lock();
+        let mut lock = ready!(pin!(lock).poll(cx));
+        Pin::new(lock.deref_mut()).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let pin = self.get_mut();
-        pin.stream
-            .lock()
-            .map(|mut lock| Pin::new(lock.deref_mut()).poll_flush(cx))
-            .unwrap_or(Poll::Ready(Err(ErrorKind::Other.into())))
+        let mut lock = pin.stream.lock();
+        let mut lock = ready!(pin!(lock).poll(cx));
+        Pin::new(lock.deref_mut()).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let pin = self.get_mut();
-        pin.stream
-            .lock()
-            .map(|mut lock| Pin::new(lock.deref_mut()).poll_shutdown(cx))
-            .unwrap_or(Poll::Ready(Err(ErrorKind::Other.into())))
+        let mut lock = pin.stream.lock();
+        let mut lock = ready!(pin!(lock).poll(cx));
+        Pin::new(lock.deref_mut()).poll_shutdown(cx)
     }
 }
 
-pub struct TlsStream {
+pub struct TlsStream<T, D> {
     stream: TcpStream,
-    session: ServerConnection,
+    session: T,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
+    _phantom: PhantomData<D>,
 }
 
-impl TlsStream {
-    fn new(stream: TcpStream, config: Arc<ServerConfig>) -> types::Result<Self> {
-        let session = ServerConnection::new(config)?;
+impl<T, D> TlsStream<T, D>
+where
+    T: DerefMut<Target = ConnectionCommon<D>>,
+    T: Unpin,
+{
+    fn new(stream: TcpStream, session: T) -> types::Result<Self> {
         Ok(Self {
             stream,
             session,
             recv_buf: vec![0u8; options().as_run().net_buffer_size * 1024],
             send_buf: Vec::new(),
+            _phantom: Default::default(),
         })
     }
 
-    pub fn into_split(self) -> (TlsReadHalf, TlsWriteHalf) {
+    pub fn into_split(self) -> (TlsReadHalf<T, D>, TlsWriteHalf<T, D>) {
         let stream = Arc::new(Mutex::new(self));
         (
             TlsReadHalf {
@@ -165,7 +187,12 @@ impl TlsStream {
     }
 }
 
-impl AsyncRead for TlsStream {
+impl<T, D> AsyncRead for TlsStream<T, D>
+where
+    T: DerefMut<Target = ConnectionCommon<D>>,
+    T: Unpin,
+    D: Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -207,7 +234,12 @@ impl AsyncRead for TlsStream {
     }
 }
 
-impl AsyncWrite for TlsStream {
+impl<T, D> AsyncWrite for TlsStream<T, D>
+where
+    T: DerefMut<Target = ConnectionCommon<D>>,
+    T: Unpin,
+    D: Unpin,
+{
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -365,9 +397,11 @@ pub async fn run() -> types::Result<()> {
 
     let listener = TcpListener::bind(options().as_run().listen_address.as_str()).await?;
     let builder = hyper::server::Server::builder(TlsAcceptor::new(listener, config)?);
-    let make_server = make_service_fn(|_conn: &TlsStream| async {
-        Ok::<_, types::Error>(service_fn(do_request))
-    });
+    let make_server = make_service_fn(
+        |_conn: &TlsStream<ServerConnection, ServerConnectionData>| async {
+            Ok::<_, types::Error>(service_fn(do_request))
+        },
+    );
 
     let server = builder.http1_keepalive(true).serve(make_server);
     if let Err(err) = server.await {
