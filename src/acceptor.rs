@@ -74,9 +74,31 @@ impl HttpsConnection {
         Ok(Self {
             stream,
             session,
-            recv_buf: vec![0u8; options().as_run().net_buffer_size],
+            recv_buf: vec![0u8; options().as_run().net_buffer_size * 1024],
             send_buf: Vec::new(),
         })
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, Error>> {
+        if self.session.wants_write() {
+            if let Err(err) = self.session.write_tls(&mut self.send_buf) {
+                return Poll::Ready(Err(err));
+            }
+        }
+        if self.send_buf.is_empty() {
+            Poll::Ready(Ok(0))
+        } else {
+            match Pin::new(&mut self.stream).poll_write(cx, self.send_buf.as_slice()) {
+                Poll::Ready(Ok(n)) => {
+                    self.send_buf.copy_within(n.., 0);
+                    unsafe {
+                        self.send_buf.set_len(self.send_buf.len() - n);
+                    }
+                    Poll::Ready(Ok(n))
+                }
+                ret => ret,
+            }
+        }
     }
 }
 
@@ -86,22 +108,38 @@ impl AsyncRead for HttpsConnection {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        log::info!("async_read poll_read");
         let pin = self.get_mut();
-        if let Err(err) = pin.session.reader().read(buf.initialize_unfilled()) {
-            if err.kind() != ErrorKind::WouldBlock {
-                return Poll::Ready(Err(err));
+        match pin.session.reader().read(buf.initialize_unfilled()) {
+            Err(err) => {
+                if err.kind() != ErrorKind::WouldBlock {
+                    log::info!("read session failed:{}", err);
+                    return Poll::Ready(Err(err));
+                }
             }
-        } else {
-            return Poll::Ready(Ok(()));
+            Ok(n) => {
+                buf.set_filled(buf.filled().len() + n);
+                return Poll::Ready(Ok(()));
+            }
         }
         let mut raw_buf = ReadBuf::new(pin.recv_buf.as_mut_slice());
         match Pin::new(&mut pin.stream).poll_read(cx, &mut raw_buf) {
             Poll::Ready(Ok(_)) => {
-                if let Err(err) = pin.session.read_tls(&mut raw_buf.filled()) {
+                log::info!("read {} bytes from stream", raw_buf.filled().len());
+                if raw_buf.filled().is_empty() {
+                    Poll::Ready(Ok(()))
+                } else if let Err(err) = pin.session.read_tls(&mut raw_buf.filled()) {
                     Poll::Ready(Err(err))
                 } else if let Err(_) = pin.session.process_new_packets() {
                     Poll::Ready(Err(ErrorKind::InvalidData.into()))
                 } else {
+                    // when handshaking, auto send data
+                    if pin.session.is_handshaking() {
+                        if let Poll::Ready(Err(err)) = pin.poll_flush(cx) {
+                            log::info!("poll_flush failed:{}", err);
+                            return Poll::Ready(Err(err));
+                        }
+                    }
                     Pin::new(pin).poll_read(cx, buf)
                 }
             }
@@ -116,49 +154,23 @@ impl AsyncWrite for HttpsConnection {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
+        log::info!("async_write poll_write");
         let pin = self.get_mut();
-        if pin.send_buf.is_empty() {
-            // session is empty, write buf to session first
-            match pin.session.writer().write(buf) {
-                // read actual data from session, drain the session.
-                Ok(n) => match pin.session.write_tls(&mut pin.send_buf) {
-                    // trying to flush data
-                    Ok(_) => match Pin::new(pin).poll_flush(cx) {
-                        Poll::Ready(Ok(_)) => Poll::Ready(Ok(n)),
-                        Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                        Poll::Pending => Poll::Pending,
-                    },
-                    Err(err) => Poll::Ready(Err(err)),
-                },
-                Err(err) => Poll::Ready(Err(err)),
-            }
-        } else {
-            // session is not empty, flush data first and always return pending, except error
-            match Pin::new(pin).poll_flush(cx).map(|t| t.map(|_| 0usize)) {
-                Poll::Ready(Ok(_)) => Poll::Pending,
+        match pin.session.writer().write(buf) {
+            // read actual data from session, drain the session.
+            Ok(n) => match pin.poll_flush(cx) {
+                // trying to flush data
+                Poll::Ready(Ok(_)) => Poll::Ready(Ok(n)),
                 ret => ret,
-            }
+            },
+            Err(err) => Poll::Ready(Err(err)),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        log::info!("async_write poll_flush");
         let pin = self.get_mut();
-        if pin.send_buf.is_empty() {
-            Poll::Ready(Ok(()))
-        } else {
-            match Pin::new(&mut pin.stream).poll_write(cx, pin.send_buf.as_slice()) {
-                Poll::Ready(Ok(0)) => Poll::Ready(Err(ErrorKind::UnexpectedEof.into())),
-                Poll::Ready(Ok(n)) => {
-                    pin.send_buf.copy_within(n.., 0);
-                    unsafe {
-                        pin.send_buf.set_len(pin.send_buf.len() - n);
-                    }
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                Poll::Pending => Poll::Pending,
-            }
-        }
+        pin.poll_flush(cx).map(|r| r.map(|_| ()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
