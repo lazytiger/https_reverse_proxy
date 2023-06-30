@@ -1,5 +1,3 @@
-use std::io::ErrorKind;
-
 use derive_more::{Display, Error, From};
 use hyper::http;
 
@@ -17,28 +15,9 @@ pub enum Error {
     HttpHeaderToStr(http::header::ToStrError),
     TrustDnsProto(trust_dns_proto::error::ProtoError),
     RustClientInvalidDnsName(rustls::client::InvalidDnsNameError),
-    //Eof,
-    DnsQuery,
-    Handshake,
     NoHostName,
-    ReaderClosed,
-    WriterClosed,
     NoPathAndQuery,
     PrivateKeyNotFound,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-pub fn from_io_error(err: std::io::Error) -> Option<Error> {
-    match err.kind() {
-        ErrorKind::WouldBlock | ErrorKind::NotConnected | ErrorKind::Interrupted => None,
-        _ => Some(Error::Handshake),
-    }
-}
-
-pub fn is_would_block(err: &std::io::Error) -> bool {
-    match err.kind() {
-        ErrorKind::NotConnected | ErrorKind::Interrupted => true,
-        _ => false,
-    }
-}
