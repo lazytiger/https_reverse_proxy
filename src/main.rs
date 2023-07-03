@@ -6,7 +6,7 @@ use clap::Parser;
 use tokio::runtime::Runtime;
 
 use crate::cert_resolver::gen_root_ca;
-use crate::options::{Command, Options, RunArgs};
+use crate::options::{Command, Options};
 use crate::types::Result;
 
 mod acceptor;
@@ -30,7 +30,7 @@ pub fn options<'a>() -> &'a Options {
                 log_level: 0,
                 ca_crt_path: "".to_string(),
                 ca_key_path: "".to_string(),
-                command: Command::Run(RunArgs {
+                command: Command::Run(crate::options::RunArgs {
                     listen_address: "".to_string(),
                     dns_server: "".to_string(),
                     certificate_store: "".to_string(),
