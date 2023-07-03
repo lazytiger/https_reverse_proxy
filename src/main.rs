@@ -6,7 +6,7 @@ use clap::Parser;
 use tokio::runtime::Runtime;
 
 use crate::cert_resolver::gen_root_ca;
-use crate::options::{Command, Options};
+use crate::options::{Command, Options, RunArgs};
 use crate::types::Result;
 
 mod acceptor;
@@ -22,7 +22,27 @@ mod utils;
 static mut OPTIONS: MaybeUninit<Options> = MaybeUninit::uninit();
 
 pub fn options<'a>() -> &'a Options {
-    unsafe { OPTIONS.assume_init_ref() }
+    unsafe {
+        #[cfg(test)]
+        {
+            OPTIONS.write(Options {
+                log_file: "".to_string(),
+                log_level: 0,
+                ca_crt_path: "".to_string(),
+                ca_key_path: "".to_string(),
+                command: Command::Run(RunArgs {
+                    listen_address: "".to_string(),
+                    dns_server: "".to_string(),
+                    certificate_store: "".to_string(),
+                    cache_store: "".to_string(),
+                    content_types: vec![],
+                    file_buffer_size: 4,
+                    net_buffer_size: 4,
+                }),
+            });
+        }
+        OPTIONS.assume_init_ref()
+    }
 }
 
 fn main() {
