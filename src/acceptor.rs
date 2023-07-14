@@ -32,19 +32,11 @@ impl Accept for TlsAcceptor {
         match Pin::new(&mut pin.listener).poll_accept(cx) {
             Poll::Ready(Ok((stream, addr))) => {
                 log::info!("new connection from:{}", addr);
-                match TlsServerStream::new(
+                let conn = TlsServerStream::new(
                     stream,
                     ServerConnection::new(pin.config.clone()).unwrap(),
-                ) {
-                    Ok(conn) => {
-                        log::info!("new connection created");
-                        Poll::Ready(Some(Ok(conn)))
-                    }
-                    Err(err) => {
-                        log::error!("failed to create connection: {}", err);
-                        Poll::Ready(None)
-                    }
-                }
+                );
+                Poll::Ready(Some(Ok(conn)))
             }
             Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err.into()))),
             Poll::Pending => Poll::Pending,

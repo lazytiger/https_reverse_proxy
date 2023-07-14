@@ -1,24 +1,45 @@
-use std::future::Future;
-use std::io::{Error, ErrorKind, Read, Write};
-use std::marker::PhantomData;
-use std::ops::DerefMut;
-use std::pin::pin;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+#![allow(dead_code)]
 
-use rustls::client::ClientConnectionData;
-use rustls::server::ServerConnectionData;
-use rustls::{ClientConnection, ConnectionCommon, ServerConnection};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use std::{
+    io::{Error, ErrorKind, Read, Write},
+    marker::PhantomData,
+    net::SocketAddr,
+    ops::DerefMut,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use crate::{options, types};
+use rustls::{
+    client::ClientConnectionData, server::ServerConnectionData, ClientConnection, ConnectionCommon,
+    ServerConnection,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+    sync::Mutex,
+};
+
+use bytes::{Buf, BufMut, BytesMut};
 
 pub type TlsServerStream = TlsStream<ServerConnection, ServerConnectionData>;
-#[allow(dead_code)]
+pub type TlsServerReadHalf = TlsReadHalf<ServerConnection, ServerConnectionData>;
+pub type TlsServerWriteHalf = TlsWriteHalf<ServerConnection, ServerConnectionData>;
 pub type TlsClientStream = TlsStream<ClientConnection, ClientConnectionData>;
+pub type TlsClientReadHalf = TlsReadHalf<ClientConnection, ClientConnectionData>;
+pub type TlsClientWriteHalf = TlsWriteHalf<ClientConnection, ClientConnectionData>;
+
+macro_rules! lock {
+    ($lock:expr, $cx:expr) => {
+        match $lock.try_lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                $cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }
+    };
+}
 
 pub struct TlsReadHalf<T, D> {
     stream: Arc<Mutex<TlsStream<T, D>>>,
@@ -36,14 +57,33 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let pin = self.get_mut();
-        let mut lock = pin.stream.lock();
-        let mut lock = ready!(pin!(lock).poll(cx));
+        let mut lock = lock!(pin.stream, cx);
         Pin::new(lock.deref_mut()).poll_read(cx, buf)
     }
 }
 
 pub struct TlsWriteHalf<T, D> {
     stream: Arc<Mutex<TlsStream<T, D>>>,
+}
+
+impl<T, D> TlsWriteHalf<T, D> {
+    pub async fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.stream.lock().await.stream.local_addr()
+    }
+
+    pub async fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.stream.lock().await.stream.peer_addr()
+    }
+}
+
+impl<T, D> TlsReadHalf<T, D> {
+    pub async fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.stream.lock().await.stream.local_addr()
+    }
+
+    pub async fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.stream.lock().await.stream.peer_addr()
+    }
 }
 
 impl<T, D> AsyncWrite for TlsWriteHalf<T, D>
@@ -58,22 +98,19 @@ where
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
         let pin = self.get_mut();
-        let mut lock = pin.stream.lock();
-        let mut lock = ready!(pin!(lock).poll(cx));
+        let mut lock = lock!(pin.stream, cx);
         Pin::new(lock.deref_mut()).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let pin = self.get_mut();
-        let mut lock = pin.stream.lock();
-        let mut lock = ready!(pin!(lock).poll(cx));
+        let mut lock = lock!(pin.stream, cx);
         Pin::new(lock.deref_mut()).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let pin = self.get_mut();
-        let mut lock = pin.stream.lock();
-        let mut lock = ready!(pin!(lock).poll(cx));
+        let mut lock = lock!(pin.stream, cx);
         Pin::new(lock.deref_mut()).poll_shutdown(cx)
     }
 }
@@ -82,7 +119,7 @@ pub struct TlsStream<T, D> {
     stream: TcpStream,
     session: T,
     recv_buf: Vec<u8>,
-    send_buf: Vec<u8>,
+    send_buf: BytesMut,
     _phantom: PhantomData<D>,
 }
 
@@ -91,17 +128,25 @@ where
     T: DerefMut<Target = ConnectionCommon<D>>,
     T: Unpin,
 {
-    pub(crate) fn new(stream: TcpStream, session: T) -> types::Result<Self> {
-        Ok(Self {
+    pub fn new(stream: TcpStream, mut session: T) -> Self {
+        session.set_buffer_limit(None);
+        Self {
             stream,
             session,
-            recv_buf: vec![0u8; options().as_run().net_buffer_size * 1024],
-            send_buf: Vec::new(),
+            recv_buf: vec![0u8; 8192],
+            send_buf: BytesMut::new(),
             _phantom: Default::default(),
-        })
+        }
     }
 
-    #[allow(dead_code)]
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.stream.peer_addr()
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.stream.local_addr()
+    }
+
     pub fn into_split(self) -> (TlsReadHalf<T, D>, TlsWriteHalf<T, D>) {
         let stream = Arc::new(Mutex::new(self));
         (
@@ -112,30 +157,35 @@ where
         )
     }
 
-    fn poll_tls_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, Error>> {
-        if self.session.wants_write() {
-            if let Err(err) = self.session.write_tls(&mut self.send_buf) {
-                return Poll::Ready(Err(err));
-            }
-        }
-        if self.send_buf.is_empty() {
-            Poll::Ready(Ok(0))
-        } else {
-            match Pin::new(&mut self.stream).poll_write(cx, self.send_buf.as_slice()) {
-                Poll::Ready(Ok(n)) => {
-                    if self.send_buf.len() == n {
-                        self.send_buf.clear();
-                    } else {
-                        self.send_buf.copy_within(n.., 0);
-                        unsafe {
-                            self.send_buf.set_len(self.send_buf.len() - n);
-                        }
-                    }
-                    Poll::Ready(Ok(n))
+    fn poll_tls_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        while self.session.wants_write() || !self.send_buf.is_empty() {
+            if self.session.wants_write() {
+                let mut send_buf = self.send_buf.split().writer();
+                if let Err(err) = self.session.write_tls(&mut send_buf) {
+                    return Poll::Ready(Err(err));
+                } else {
+                    self.send_buf.unsplit(send_buf.into_inner());
                 }
-                ret => ret,
+            }
+
+            if !self.send_buf.is_empty() {
+                match Pin::new(&mut self.stream).poll_write(cx, self.send_buf.as_ref()) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(ErrorKind::BrokenPipe.into()));
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        self.send_buf.advance(n);
+                    }
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(Err(err));
+                    }
+                    Poll::Pending => {
+                        return Poll::Pending;
+                    }
+                }
             }
         }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -167,16 +217,28 @@ where
             Poll::Ready(Ok(_)) => {
                 if raw_buf.filled().is_empty() {
                     Poll::Ready(Ok(()))
-                } else if let Err(err) = pin.session.read_tls(&mut raw_buf.filled()) {
-                    Poll::Ready(Err(err))
-                } else if let Err(_) = pin.session.process_new_packets() {
-                    Poll::Ready(Err(ErrorKind::InvalidData.into()))
-                } else {
-                    if let Poll::Ready(Err(err)) = pin.poll_tls_write(cx) {
-                        Poll::Ready(Err(err))
-                    } else {
-                        Pin::new(pin).poll_read(cx, buf)
+                } else if let Err(err) = {
+                    let mut data = raw_buf.filled();
+                    loop {
+                        match pin.session.read_tls(&mut data) {
+                            Err(err) => break Err(err),
+                            Ok(0) => unreachable!(),
+                            Ok(_) => {
+                                if data.is_empty() {
+                                    break Ok(());
+                                }
+                                log::error!("data not flushed into tls once");
+                            }
+                        }
                     }
+                } {
+                    Poll::Ready(Err(err))
+                } else if pin.session.process_new_packets().is_err() {
+                    Poll::Ready(Err(ErrorKind::InvalidData.into()))
+                } else if let Poll::Ready(Err(err)) = pin.poll_tls_flush(cx) {
+                    Poll::Ready(Err(err))
+                } else {
+                    Pin::new(pin).poll_read(cx, buf)
                 }
             }
             ret => ret,
@@ -196,12 +258,20 @@ where
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
         let pin = self.get_mut();
+        match pin.poll_tls_flush(cx) {
+            Poll::Pending => {
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(err)) => {
+                return Poll::Ready(Err(err));
+            }
+            _ => {}
+        }
         match pin.session.writer().write(buf) {
             // read actual data from session, drain the session.
-            Ok(n) => match pin.poll_tls_write(cx) {
-                // trying to flush data
-                Poll::Ready(Ok(_)) | Poll::Pending => Poll::Ready(Ok(n)),
-                ret => ret,
+            Ok(n) => match pin.poll_tls_flush(cx) {
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                _ => Poll::Ready(Ok(n)),
             },
             Err(err) => Poll::Ready(Err(err)),
         }
@@ -209,7 +279,7 @@ where
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let pin = self.get_mut();
-        pin.poll_tls_write(cx).map(|r| r.map(|_| ()))
+        pin.poll_tls_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
@@ -218,64 +288,16 @@ where
     }
 }
 
-#[cfg(test)]
 mod test {
-    use std::sync::Arc;
-
-    use hyper_rustls::ConfigBuilderExt;
-    use rustls::{ClientConfig, ClientConnection};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-
-    use crate::tls_stream::TlsClientStream;
-
     #[test]
-    fn test_async() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        println!("start testing now");
-        runtime.block_on(async {
-            let stream = TcpStream::connect("110.242.68.3:443").await.unwrap();
-            let client_config = Arc::new(
-                ClientConfig::builder()
-                    .with_safe_defaults()
-                    .with_native_roots()
-                    .with_no_client_auth(),
-            );
-            let session =
-                ClientConnection::new(client_config, "www.baidu.com".try_into().unwrap()).unwrap();
-            let client = TlsClientStream::new(stream, session).unwrap();
-            let (mut read_half, mut write_half) = client.into_split();
-            println!("start sending request");
-            write_half
-                .write_all("GET / HTTP/1.1\r\n".as_bytes())
-                .await
-                .unwrap();
-            write_half
-                .write_all("Host: www.baidu.com\r\n".as_bytes())
-                .await
-                .unwrap();
-            write_half
-                .write_all("User-Agent: test\r\n".as_bytes())
-                .await
-                .unwrap();
-            write_half
-                .write_all("Accept: */*\r\n".as_bytes())
-                .await
-                .unwrap();
-            println!("write request finished");
-            write_half.write_all("\r\n".as_bytes()).await.unwrap();
-            let mut data = vec![0u8; 4096];
-            let size = read_half.read(data.as_mut_slice()).await.unwrap();
-            if size == 0 {
-                println!("read from client failed");
-            } else {
-                unsafe { data.set_len(size) }
-                println!(
-                    "read {} bytes, response:{}",
-                    size,
-                    String::from_utf8(data).unwrap()
-                );
-            }
-        });
+    fn test_bytes() {
+        use bytes::{BufMut, BytesMut};
+        use std::io::Write;
+        let mut buffer = BytesMut::new();
+        buffer.extend_from_slice(b"hello, world.");
+        let mut writer = buffer.split().writer();
+        writer.write_all(b"world, hello.").unwrap();
+        buffer.unsplit(writer.into_inner());
+        println!("{}", String::from_utf8_lossy(buffer.as_ref()));
     }
 }
