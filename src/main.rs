@@ -32,7 +32,6 @@ pub fn options<'a>() -> &'a Options {
                 ca_key_path: "".to_string(),
                 command: Command::Run(crate::options::RunArgs {
                     listen_address: "".to_string(),
-                    dns_server: "".to_string(),
                     certificate_store: "".to_string(),
                     cache_store: "".to_string(),
                     content_types: vec![],
